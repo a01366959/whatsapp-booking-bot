@@ -1,3 +1,6 @@
+/******************************************************************
+ * 1. IMPORTS & SETUP
+ ******************************************************************/
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
@@ -9,314 +12,251 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-/**
- * ============================
- * SESSION MEMORY
- * ============================
- */
-const sessions = {};
+/******************************************************************
+ * 2. CONSTANTS
+ ******************************************************************/
+const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
+const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
 
-/**
- * ============================
- * WEBHOOK VERIFY
- * ============================
- */
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === process.env.WEBHOOK_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
-
-/**
- * ============================
- * INCOMING MESSAGES
- * ============================
- */
-app.post("/webhook", async (req, res) => {
-  try {
-    const message =
-      req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message) return res.sendStatus(200);
-
-    const phone = message.from;
-
-    if (!sessions[phone]) {
-      sessions[phone] = { step: "menu" };
-      await findUser(phone);
-      await sendMainMenu(phone);
-      return res.sendStatus(200);
-    }
-
-    if (message.type === "interactive") {
-      await handleInteraction(phone, message.interactive);
-      return res.sendStatus(200);
-    }
-
-    if (message.type === "text") {
-      await handleFreeText(phone, message.text.body);
-    }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err.response?.data || err.message);
-    res.sendStatus(200);
-  }
-});
-
-/**
- * ============================
- * AI UNDERSTANDING
- * ============================
- */
-async function understandMessage(phone, text) {
-  const s = sessions[phone];
-
-  const prompt = `
-You are a booking intent parser.
-
-Context:
-- Expected step: ${s.step}
-- Known date: ${s.date || "null"}
-- Known time: ${s.time || "null"}
-
-User message:
-"${text}"
-
-Return ONLY JSON:
+/******************************************************************
+ * 3. IN-MEMORY STORAGE (REPLACE WITH REDIS LATER)
+ ******************************************************************/
+const sessions = new Map(); 
+/*
+session structure:
 {
-  "intent": "menu | book | hours | info | date | time | confirm | unknown",
-  "date": null or "YYYY-MM-DD",
-  "time": null or "HH:mm"
+  messages: [],
+  state: "idle" | "awaiting_date" | "awaiting_time" | "confirming",
+  user: { name },
+  date: null,
+  availableHours: [],
+  time: null
 }
-`;
+*/
 
-  const res = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [{ role: "system", content: prompt }]
-  });
+/******************************************************************
+ * 4. SYSTEM PROMPT (CORE BRAIN)
+ ******************************************************************/
+const SYSTEM_MESSAGE = {
+  role: "system",
+  content: `
+You are an AI WhatsApp assistant for a padel club in Mexico.
 
-  return JSON.parse(res.choices[0].message.content);
-}
+Goals:
+- Be conversational and natural.
+- Help users reserve courts.
+- Answer questions about the club.
 
-/**
- * ============================
- * FREE TEXT HANDLER
- * ============================
- */
-async function handleFreeText(phone, text) {
-  const ai = await understandMessage(phone, text);
-  const s = sessions[phone];
+Rules:
+- Availability, bookings and users come ONLY from Bubble workflows.
+- Never invent availability.
+- Never confirm a booking without calling Bubble.
+- Ask for missing info step by step.
+- Use buttons ONLY when selecting dates or times.
+- If multiple courts share the same hour, show it only once.
+- Maintain context across messages.
+- Respond in Mexican Spanish.
+`
+};
 
-  if (ai.intent === "hours") {
-    return sendText(
-      phone,
-      "🕘 Horarios:\nL–V 7:00–22:00\nS–D 8:00–20:00"
-    );
-  }
-
-  if (ai.intent === "info") {
-    return sendText(
-      phone,
-      "🎾 Black Padel & Pickleball\n📍 CDMX\n📞 Reservas por WhatsApp"
-    );
-  }
-
-  if (ai.date) {
-    s.date = ai.date;
-    s.step = "choose_time";
-    await loadAvailableHours(phone);
-    return sendTimeButtons(phone);
-  }
-
-  if (ai.time) {
-    s.time = ai.time;
-    s.step = "confirm";
-    return sendConfirmation(phone);
-  }
-
-  return sendMainMenu(phone);
-}
-
-/**
- * ============================
- * INTERACTIONS
- * ============================
- */
-async function handleInteraction(phone, interactive) {
-  const id =
-    interactive.button_reply?.id ||
-    interactive.list_reply?.id;
-
-  if (!id) return;
-
-  if (id === "menu_book") {
-    sessions[phone].step = "choose_date";
-    return sendDateList(phone);
-  }
-
-  if (id.startsWith("date_")) {
-    sessions[phone].date = id.replace("date_", "");
-    await loadAvailableHours(phone);
-    return sendTimeButtons(phone);
-  }
-
-  if (id.startsWith("time_")) {
-    sessions[phone].time = id.replace("time_", "");
-    return sendConfirmation(phone);
-  }
-
-  if (id === "confirm_booking") {
-    await confirmBooking(phone);
-    delete sessions[phone];
-    return sendText(phone, "✅ ¡Reserva confirmada!");
-  }
-}
-
-/**
- * ============================
- * BUBBLE
- * ============================
- */
+/******************************************************************
+ * 5. BUBBLE WORKFLOWS
+ ******************************************************************/
 async function findUser(phone) {
-  const res = await axios.get(
-    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/find_user`,
-    { params: { phone } }
-  );
+  const res = await axios.get(`${BUBBLE}/find_user`, { params: { phone } });
+  return res.data.response;
+}
 
-  if (res.data.response?.found) {
-    sessions[phone].name = res.data.response.name;
+async function getAvailableHours(date) {
+  const res = await axios.get(`${BUBBLE}/get_available_hours`, { params: { date } });
+  const slots = res.data.response?.timeslots || [];
+  return [...new Set(slots)]; // remove duplicates
+}
+
+async function confirmBooking(phone, date, time) {
+  await axios.post(`${BUBBLE}/confirm_booking`, {
+    phone,
+    date,
+    time
+  });
+}
+
+/******************************************************************
+ * 6. OPENAI CALL (RESPONSES API)
+ ******************************************************************/
+async function runAI(messages) {
+  const response = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: messages,
+    temperature: 0.4,
+    max_output_tokens: 300
+  });
+
+  return response.output_text;
+}
+
+/******************************************************************
+ * 7. INTENT & DATE EXTRACTION (LIGHTWEIGHT NLP)
+ ******************************************************************/
+function detectIntent(text) {
+  const t = text.toLowerCase();
+
+  if (t.includes("reserv")) return "reserve";
+  if (t.includes("horario")) return "hours";
+  if (t.includes("info") || t.includes("ubic")) return "info";
+  if (t.includes("sí") || t.includes("confirm")) return "confirm";
+
+  return "chat";
+}
+
+function extractDate(text) {
+  if (text.includes("hoy")) return new Date().toISOString().slice(0, 10);
+  if (text.includes("mañana")) {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
   }
+  return null;
 }
 
-async function loadAvailableHours(phone) {
-  const s = sessions[phone];
-  const res = await axios.get(
-    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/get_available_hours`,
-    { params: { date: s.date } }
-  );
-
-  const unique = [...new Set(res.data.response.timeslots)];
-  s.availableHours = unique;
-}
-
-async function confirmBooking(phone) {
-  const s = sessions[phone];
-  await axios.post(
-    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/confirm_booking`,
-    {
-      phone,
-      date: s.date,
-      time: s.time
-    }
-  );
-}
-
-/**
- * ============================
- * WHATSAPP UI
- * ============================
- */
-async function sendMainMenu(phone) {
-  const name = sessions[phone]?.name;
-  await sendInteractive(phone, {
-    type: "button",
-    body: {
-      text: `Hola ${name || ""} 👋\n¿Qué te gustaría hacer?`
-    },
-    action: {
-      buttons: [
-        { type: "reply", reply: { id: "menu_book", title: "📅 Reservar" } },
-        { type: "reply", reply: { id: "menu_hours", title: "⏰ Horarios" } },
-        { type: "reply", reply: { id: "menu_info", title: "ℹ️ Información" } }
-      ]
-    }
-  });
-}
-
-async function sendDateList(phone) {
-  await sendInteractive(phone, {
-    type: "list",
-    body: { text: "📅 Elige una fecha" },
-    action: {
-      button: "Seleccionar",
-      sections: [
-        {
-          rows: [
-            { id: "date_today", title: "Hoy" },
-            { id: "date_tomorrow", title: "Mañana" }
-          ]
-        }
-      ]
-    }
-  });
-}
-
-async function sendTimeButtons(phone) {
-  const hours = sessions[phone].availableHours;
-  await sendInteractive(phone, {
-    type: "button",
-    body: { text: "⏰ Elige un horario" },
-    action: {
-      buttons: hours.slice(0, 3).map(h => ({
-        type: "reply",
-        reply: { id: `time_${h}`, title: h }
-      }))
-    }
-  });
-}
-
-async function sendConfirmation(phone) {
-  await sendInteractive(phone, {
-    type: "button",
-    body: { text: "¿Confirmar reserva?" },
-    action: {
-      buttons: [
-        { type: "reply", reply: { id: "confirm_booking", title: "Confirmar" } }
-      ]
-    }
-  });
-}
-
+/******************************************************************
+ * 8. WHATSAPP SENDERS
+ ******************************************************************/
 async function sendText(phone, text) {
   await axios.post(
-    `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+    WHATSAPP_API,
     {
       messaging_product: "whatsapp",
       to: phone,
       type: "text",
       text: { body: text }
     },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`
-      }
-    }
+    { headers: authHeaders() }
   );
 }
 
-async function sendInteractive(phone, interactive) {
+async function sendButtons(phone, text, buttons) {
   await axios.post(
-    `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+    WHATSAPP_API,
     {
       messaging_product: "whatsapp",
       to: phone,
       type: "interactive",
-      interactive
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`
+      interactive: {
+        type: "button",
+        body: { text },
+        action: { buttons }
       }
-    }
+    },
+    { headers: authHeaders() }
   );
 }
 
+function authHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+    "Content-Type": "application/json"
+  };
+}
+
+/******************************************************************
+ * 9. MAIN WEBHOOK
+ ******************************************************************/
+app.post("/webhook", async (req, res) => {
+  try {
+    const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!msg) return res.sendStatus(200);
+
+    const phone = msg.from;
+    const text = msg.text?.body || "";
+
+    if (!sessions.has(phone)) {
+      const user = await findUser(phone);
+      sessions.set(phone, {
+        messages: [SYSTEM_MESSAGE],
+        state: "idle",
+        user,
+        date: null,
+        availableHours: [],
+        time: null
+      });
+    }
+
+    const session = sessions.get(phone);
+    session.messages.push({ role: "user", content: text });
+
+    const intent = detectIntent(text);
+
+    /**************************************************************
+     * 9.1 RESERVATION FLOW
+     **************************************************************/
+    if (intent === "reserve" && session.state === "idle") {
+      session.state = "awaiting_date";
+      await sendText(phone, "Perfecto, ¿para qué fecha quieres reservar?");
+      return res.sendStatus(200);
+    }
+
+    if (session.state === "awaiting_date") {
+      const date = extractDate(text);
+      if (!date) {
+        await sendText(phone, "Dime la fecha (por ejemplo: hoy o mañana).");
+        return res.sendStatus(200);
+      }
+
+      session.date = date;
+      session.availableHours = await getAvailableHours(date);
+
+      if (!session.availableHours.length) {
+        await sendText(phone, "No hay horarios disponibles ese día.");
+        session.state = "idle";
+        return res.sendStatus(200);
+      }
+
+      session.state = "awaiting_time";
+
+      await sendButtons(
+        phone,
+        "Estos son los horarios disponibles:",
+        session.availableHours.slice(0, 3).map(h => ({
+          type: "reply",
+          reply: { id: h, title: h }
+        }))
+      );
+
+      return res.sendStatus(200);
+    }
+
+    if (session.state === "awaiting_time") {
+      session.time = text;
+      session.state = "confirming";
+      await sendText(phone, `¿Confirmo tu reserva el ${session.date} a las ${session.time}?`);
+      return res.sendStatus(200);
+    }
+
+    if (session.state === "confirming" && intent === "confirm") {
+      await confirmBooking(phone, session.date, session.time);
+      await sendText(phone, "Reserva confirmada. ¡Te esperamos!");
+      sessions.delete(phone);
+      return res.sendStatus(200);
+    }
+
+    /**************************************************************
+     * 9.2 GENERAL AI CHAT
+     **************************************************************/
+    const aiReply = await runAI(session.messages);
+    session.messages.push({ role: "assistant", content: aiReply });
+    await sendText(phone, aiReply);
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+    res.sendStatus(500);
+  }
+});
+
+/******************************************************************
+ * 10. SERVER START
+ ******************************************************************/
 app.listen(process.env.PORT || 3000, () => {
-  console.log("✅ AI WhatsApp bot running");
+  console.log("WhatsApp AI Agent running");
 });
