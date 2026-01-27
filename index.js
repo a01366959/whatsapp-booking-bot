@@ -4,6 +4,20 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
+// Webhook verification (Meta / WhatsApp)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  // El token debe coincidir con el que pongas en Meta
+  if (mode === "subscribe" && token === "testtoken") {
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
 const sessions = {};
 
 // WhatsApp webhook
