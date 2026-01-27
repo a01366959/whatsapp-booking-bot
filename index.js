@@ -1,15 +1,22 @@
 /******************************************************************
- * FULL AI AGENT — WHATSAPP
+ * FULL AI AGENT — WHATSAPP (REDIS FIXED)
  ******************************************************************/
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
+import { Redis } from "@upstash/redis";
 
 const app = express();
 app.use(express.json());
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+/******************************************************************
+ * CLIENTS
+ ******************************************************************/
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN
 });
 
 /******************************************************************
@@ -20,32 +27,25 @@ const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
 const DEFAULT_SPORT = "padel";
 
 /******************************************************************
- * MEMORY
- ******************************************************************/
-const sessions = new Map();
-
-/******************************************************************
- * SYSTEM PROMPT
+ * SYSTEM PROMPT (BLINDADO)
  ******************************************************************/
 const SYSTEM_MESSAGE = {
   role: "system",
   content: `
-Eres un recepcionista humano por WhatsApp para Black Padel & Pickleball en México.
+Eres un recepcionista humano de Black Padel & Pickleball (México).
 
-Hablas natural, cercano y empático.
-NO repites saludos.
-NO preguntas cosas que ya sabes.
-NO inventas horarios.
+REGLAS DURAS:
+- NO repitas saludos
+- NO inventes información
+- NO respondas programación, código, temas técnicos, ilegales o fuera del club
+- Si preguntan algo fuera del club, responde educadamente que solo ayudas con temas del club
+- Si ya hay fecha, NO la pidas otra vez
+- Si ya hay horarios, NO preguntes horas
 
-Si ya existe fecha, no la vuelvas a pedir.
-Si ya existen horarios, no preguntes horas.
-
-Responde SIEMPRE en JSON:
-
+RESPONDE SOLO JSON:
 {
-  "intent": "reserve | provide_date | provide_time | general",
-  "reply": "mensaje",
-  "date": "YYYY-MM-DD | null",
+  "intent": "reserve | general",
+  "reply": "mensaje natural",
   "time": "HH:MM | null"
 }
 `
@@ -71,6 +71,14 @@ const resolveDate = text => {
 };
 
 /******************************************************************
+ * REDIS SESSION
+ ******************************************************************/
+const getSession = phone => redis.get(`session:${phone}`);
+const saveSession = (phone, session) =>
+  redis.set(`session:${phone}`, session, { ex: 1800 });
+const clearSession = phone => redis.del(`session:${phone}`);
+
+/******************************************************************
  * BUBBLE
  ******************************************************************/
 async function findUser(phone) {
@@ -82,6 +90,7 @@ async function getAvailableHours(date) {
   const r = await axios.get(`${BUBBLE}/get_available_hours`, {
     params:{ sport: DEFAULT_SPORT, date }
   });
+
   return [...new Set(r.data.response.hours)].sort();
 }
 
@@ -94,16 +103,16 @@ async function confirmBooking(phone, date, time) {
  ******************************************************************/
 async function askAgent(messages) {
   const r = await openai.responses.create({
-    model:"gpt-4.1-mini",
+    model: "gpt-4.1-mini",
     input: messages,
-    temperature:0.3,
-    max_output_tokens:300
+    temperature: 0.25,
+    max_output_tokens: 250
   });
 
   try {
     return JSON.parse(r.output_text);
   } catch {
-    return { intent:"general", reply:r.output_text };
+    return { intent:"general", reply:"¿Te ayudo con una reserva o información del club?" };
   }
 }
 
@@ -138,33 +147,37 @@ app.post("/webhook", async (req,res)=>{
   const phone = normalizePhone(msg.from);
   const text = msg.text?.body || "";
 
-  if (!sessions.has(phone)) {
+  let session = await getSession(phone);
+
+  if (!session) {
     const user = await findUser(phone);
-    sessions.set(phone,{
+    session = {
       messages:[SYSTEM_MESSAGE],
       user,
       date:null,
       hours:null,
-      hasFetchedHours:false
-    });
-    await sendText(phone, user.found ? `Hola ${user.name} 👋 ¿Cómo te ayudo hoy?` : "Hola 👋 ¿Cómo te ayudo hoy?");
-    return res.sendStatus(200);
+      fetched:false
+    };
+
+    await sendText(
+      phone,
+      user.found ? `Hola ${user.name} 👋 ¿Cómo te ayudo hoy?` : "Hola 👋 ¿Cómo te ayudo hoy?"
+    );
   }
 
-  const session = sessions.get(phone);
   session.messages.push({ role:"user", content:text });
 
-  const agent = await askAgent(session.messages);
-
-  if (agent.date) session.date = agent.date;
+  // Fecha directa (sin IA)
   if (!session.date) {
     const d = resolveDate(text);
     if (d) session.date = d;
   }
 
-  // RESERVA
-  if (session.date && !session.hasFetchedHours) {
-    session.hasFetchedHours = true;
+  const agent = await askAgent(session.messages);
+
+  // === SI YA TENEMOS FECHA → MOSTRAR HORARIOS UNA VEZ ===
+  if (session.date && !session.fetched) {
+    session.fetched = true;
     await sendText(phone,"Déjame revisar los horarios disponibles…");
     session.hours = await getAvailableHours(session.date);
 
@@ -176,21 +189,24 @@ app.post("/webhook", async (req,res)=>{
         reply:{ id:h, title:h }
       }))
     );
+
+    await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
-  // CONFIRMAR
+  // === CONFIRMAR ===
   if (session.hours?.includes(agent.time)) {
     await confirmBooking(phone, session.date, agent.time);
     await sendText(phone,"¡Listo! Tu reserva quedó confirmada 🙌");
-    sessions.delete(phone);
+    await clearSession(phone);
     return res.sendStatus(200);
   }
 
-  // CHAT NORMAL
+  // === CHAT GENERAL CONTROLADO ===
   await sendText(phone, agent.reply);
   session.messages.push({ role:"assistant", content:agent.reply });
 
+  await saveSession(phone, session);
   res.sendStatus(200);
 });
 
@@ -198,5 +214,5 @@ app.post("/webhook", async (req,res)=>{
  * SERVER
  ******************************************************************/
 app.listen(process.env.PORT || 3000,()=>{
-  console.log("FULL AI AGENT RUNNING");
+  console.log("FULL AI AGENT RUNNING (REDIS)");
 });
