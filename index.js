@@ -22,45 +22,32 @@ app.get("/webhook", (req, res) => {
 
 /**
  * ============================
- * 2. SESSION STORAGE (TEMP)
+ * 2. SESSION STORAGE
  * ============================
  */
 const sessions = {};
 
 /**
  * ============================
- * 3. INCOMING WHATSAPP MESSAGES
+ * 3. INCOMING WHATSAPP
  * ============================
  */
 app.post("/webhook", async (req, res) => {
   try {
     const message =
       req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-
     if (!message) return res.sendStatus(200);
 
     const phone = message.from;
     const type = message.type;
 
     if (!sessions[phone]) {
-      sessions[phone] = {};
-      await findUser(phone);
+      sessions[phone] = { phone };
+      await findUser(phone); // 🔥 SIEMPRE
     }
 
     if (type === "text") {
-      const text = message.text.body.toLowerCase();
-
-      if (text.includes("book")) {
-        await sendDateList(phone);
-      } else {
-        const name = sessions[phone].name;
-        await sendText(
-          phone,
-          name
-            ? `Hola ${name} 👋\nEscribe *book* para reservar`
-            : "Hola 👋\nEscribe *book* para reservar"
-        );
-      }
+      await sendMainMenu(phone);
     }
 
     if (type === "interactive") {
@@ -76,7 +63,77 @@ app.post("/webhook", async (req, res) => {
 
 /**
  * ============================
- * 4. BUBBLE CALLS
+ * 4. INTERACTIONS
+ * ============================
+ */
+async function handleInteraction(phone, interactive) {
+  const id =
+    interactive.button_reply?.id ||
+    interactive.list_reply?.id;
+
+  if (!id) return;
+
+  // MENÚ
+  if (id === "menu_book") {
+    await sendDateList(phone);
+    return;
+  }
+
+  if (id === "menu_hours") {
+    await sendText(
+      phone,
+      "🕘 Horario del club:\n\nLunes a Domingo\n7:00 AM – 11:00 PM"
+    );
+    await sendMainMenu(phone);
+    return;
+  }
+
+  if (id === "menu_info") {
+    await sendText(
+      phone,
+      "📍 Black Padel & Pickleball\n\nPadel y Pickleball premium.\nReserva fácil por WhatsApp."
+    );
+    await sendMainMenu(phone);
+    return;
+  }
+
+  // FECHA
+  if (id.startsWith("date_")) {
+    const date = id.replace("date_", "");
+    sessions[phone].date = date;
+
+    try {
+      await getAvailableHours(phone, date);
+      await sendTimeButtons(phone);
+    } catch {
+      await sendText(phone, "❌ No hay horarios disponibles.");
+      await sendDateList(phone);
+    }
+  }
+
+  // HORA
+  if (id.startsWith("time_")) {
+    sessions[phone].time = id.replace("time_", "");
+    await sendConfirmation(phone);
+  }
+
+  // CONFIRMAR
+  if (id === "confirm") {
+    try {
+      await confirmBooking(phone);
+      await sendText(phone, "🎉 Reserva confirmada");
+      delete sessions[phone];
+      await sendMainMenu(phone);
+    } catch {
+      await sendText(phone, "❌ Ese horario ya no está disponible.");
+      await sendMainMenu(phone);
+    }
+  }
+}
+
+/**
+ * ============================
+ * 5. BUBBLE WORKFLOWS
  * ============================
  */
 async function findUser(phone) {
@@ -96,59 +153,24 @@ async function getAvailableHours(phone, date) {
     { params: { date } }
   );
 
-  sessions[phone].availableHours = res.data.response.hours;
+  const hours = res.data.response?.hours;
+  if (!hours || hours.length === 0) throw new Error();
+
+  // eliminar duplicados
+  sessions[phone].availableHours = [...new Set(hours)];
 }
 
-async function confirmReservation(phone) {
-  const session = sessions[phone];
+async function confirmBooking(phone) {
+  const s = sessions[phone];
 
   await axios.post(
-    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/confirm_reservation`,
+    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/confirm_booking`,
     {
-      phone,
-      date: session.date,
-      time: session.time
+      phone: s.phone,
+      date: s.date,
+      time: s.time
     }
   );
-}
-
-/**
- * ============================
- * 5. HANDLE INTERACTIONS
- * ============================
- */
-async function handleInteraction(phone, interactive) {
-  const id =
-    interactive.list_reply?.id ||
-    interactive.button_reply?.id;
-
-  if (!id) return;
-
-  if (id.startsWith("date_")) {
-    const date = id.replace("date_", "");
-    sessions[phone].date = date;
-
-    await getAvailableHours(phone, date);
-    await sendTimeButtons(phone);
-  }
-
-  if (id.startsWith("time_")) {
-    sessions[phone].time = id.replace("time_", "");
-    await sendConfirmation(phone);
-  }
-
-  if (id === "confirm") {
-    try {
-      await confirmReservation(phone);
-      await sendText(phone, "🎉 Reserva confirmada en Black Padel & Pickleball");
-      delete sessions[phone];
-    } catch {
-      await sendText(
-        phone,
-        "❌ Ese horario ya no está disponible. Intenta otro."
-      );
-    }
-  }
 }
 
 /**
@@ -156,19 +178,41 @@ async function handleInteraction(phone, interactive) {
  * 6. WHATSAPP UI
  * ============================
  */
+async function sendMainMenu(phone) {
+  const name = sessions[phone].name;
+  const greeting = name
+    ? `Hola ${name} 👋`
+    : "Hola 👋";
+
+  await sendInteractive(phone, {
+    type: "button",
+    body: {
+      text: `${greeting}\n\n🎾 *Black Padel & Pickleball*\n¿Qué te gustaría hacer?`
+    },
+    action: {
+      buttons: [
+        { type: "reply", reply: { id: "menu_book", title: "📅 Reservar cancha" } },
+        { type: "reply", reply: { id: "menu_hours", title: "⏰ Horarios" } },
+        { type: "reply", reply: { id: "menu_info", title: "ℹ️ Información" } }
+      ]
+    }
+  });
+}
+
 async function sendDateList(phone) {
   await sendInteractive(phone, {
     type: "list",
     body: { text: "📅 Elige una fecha" },
     action: {
-      button: "Seleccionar fecha",
+      button: "Seleccionar",
       sections: [
         {
-          title: "Fechas disponibles",
+          title: "Fechas",
           rows: [
-            { id: "date_2026-01-27", title: "Hoy" },
-            { id: "date_2026-01-28", title: "Mañana" },
-            { id: "date_2026-01-29", title: "Jueves" }
+            { id: "date_today", title: "Hoy" },
+            { id: "date_tomorrow", title: "Mañana" },
+            { id: "date_plus2", title: "En 2 días" },
+            { id: "date_manual", title: "Ingresar fecha (DD MM)" }
           ]
         }
       ]
@@ -177,20 +221,15 @@ async function sendDateList(phone) {
 }
 
 async function sendTimeButtons(phone) {
-  const hours = sessions[phone].availableHours || [];
+  const buttons = sessions[phone].availableHours.slice(0, 3).map(h => ({
+    type: "reply",
+    reply: { id: `time_${h}`, title: h }
+  }));
 
   await sendInteractive(phone, {
     type: "button",
     body: { text: "⏰ Elige un horario" },
-    action: {
-      buttons: hours.slice(0, 3).map(h => ({
-        type: "reply",
-        reply: {
-          id: `time_${h}`,
-          title: h
-        }
-      }))
-    }
+    action: { buttons }
   });
 }
 
@@ -200,10 +239,7 @@ async function sendConfirmation(phone) {
     body: { text: "✅ ¿Confirmar reserva?" },
     action: {
       buttons: [
-        {
-          type: "reply",
-          reply: { id: "confirm", title: "Confirmar" }
-        }
+        { type: "reply", reply: { id: "confirm", title: "Confirmar" } }
       ]
     }
   });
@@ -211,7 +247,7 @@ async function sendConfirmation(phone) {
 
 /**
  * ============================
- * 7. SEND MESSAGES
+ * 7. SENDERS
  * ============================
  */
 async function sendText(phone, text) {
@@ -252,7 +288,7 @@ async function sendInteractive(phone, interactive) {
 
 /**
  * ============================
- * 8. START SERVER
+ * 8. START
  * ============================
  */
 app.listen(process.env.PORT || 3000, () => {
