@@ -14,14 +14,10 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (
-    mode === "subscribe" &&
-    token === process.env.WEBHOOK_VERIFY_TOKEN
-  ) {
+  if (mode === "subscribe" && token === process.env.WEBHOOK_VERIFY_TOKEN) {
     return res.status(200).send(challenge);
-  } else {
-    return res.sendStatus(403);
   }
+  return res.sendStatus(403);
 });
 
 /**
@@ -47,17 +43,23 @@ app.post("/webhook", async (req, res) => {
     const type = message.type;
 
     if (!sessions[phone]) {
-      sessions[phone] = { step: "start" };
+      sessions[phone] = {};
+      await findUser(phone);
     }
 
     if (type === "text") {
       const text = message.text.body.toLowerCase();
 
       if (text.includes("book")) {
-        sessions[phone].step = "choose_date";
         await sendDateList(phone);
       } else {
-        await sendText(phone, "Hi! Type *book* to start 📅");
+        const name = sessions[phone].name;
+        await sendText(
+          phone,
+          name
+            ? `Hola ${name} 👋\nEscribe *book* para reservar`
+            : "Hola 👋\nEscribe *book* para reservar"
+        );
       }
     }
 
@@ -74,7 +76,45 @@ app.post("/webhook", async (req, res) => {
 
 /**
  * ============================
- * 4. HANDLE BUTTON / LIST CLICKS
+ * 4. BUBBLE CALLS
+ * ============================
+ */
+async function findUser(phone) {
+  const res = await axios.get(
+    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/find_user`,
+    { params: { phone } }
+  );
+
+  if (res.data.response?.found) {
+    sessions[phone].name = res.data.response.name;
+  }
+}
+
+async function getAvailableHours(phone, date) {
+  const res = await axios.get(
+    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/get_available_hours`,
+    { params: { date } }
+  );
+
+  sessions[phone].availableHours = res.data.response.hours;
+}
+
+async function confirmReservation(phone) {
+  const session = sessions[phone];
+
+  await axios.post(
+    `${process.env.BUBBLE_BASE_URL}/api/1.1/wf/confirm_reservation`,
+    {
+      phone,
+      date: session.date,
+      time: session.time
+    }
+  );
+}
+
+/**
+ * ============================
+ * 5. HANDLE INTERACTIONS
  * ============================
  */
 async function handleInteraction(phone, interactive) {
@@ -85,7 +125,10 @@ async function handleInteraction(phone, interactive) {
   if (!id) return;
 
   if (id.startsWith("date_")) {
-    sessions[phone].date = id.replace("date_", "");
+    const date = id.replace("date_", "");
+    sessions[phone].date = date;
+
+    await getAvailableHours(phone, date);
     await sendTimeButtons(phone);
   }
 
@@ -95,30 +138,37 @@ async function handleInteraction(phone, interactive) {
   }
 
   if (id === "confirm") {
-    await sendText(phone, "🎉 Booking confirmed!");
-    delete sessions[phone];
+    try {
+      await confirmReservation(phone);
+      await sendText(phone, "🎉 Reserva confirmada en Black Padel & Pickleball");
+      delete sessions[phone];
+    } catch {
+      await sendText(
+        phone,
+        "❌ Ese horario ya no está disponible. Intenta otro."
+      );
+    }
   }
 }
 
 /**
  * ============================
- * 5. WHATSAPP UI MESSAGES
+ * 6. WHATSAPP UI
  * ============================
  */
 async function sendDateList(phone) {
   await sendInteractive(phone, {
     type: "list",
-    body: {
-      text: "📅 Choose a date"
-    },
+    body: { text: "📅 Elige una fecha" },
     action: {
-      button: "Select date",
+      button: "Seleccionar fecha",
       sections: [
         {
-          title: "Available dates",
+          title: "Fechas disponibles",
           rows: [
-            { id: "date_2026-01-27", title: "Tomorrow" },
-            { id: "date_2026-01-28", title: "Wed Jan 28" }
+            { id: "date_2026-01-27", title: "Hoy" },
+            { id: "date_2026-01-28", title: "Mañana" },
+            { id: "date_2026-01-29", title: "Jueves" }
           ]
         }
       ]
@@ -127,22 +177,19 @@ async function sendDateList(phone) {
 }
 
 async function sendTimeButtons(phone) {
+  const hours = sessions[phone].availableHours || [];
+
   await sendInteractive(phone, {
     type: "button",
-    body: {
-      text: "⏰ Choose a time"
-    },
+    body: { text: "⏰ Elige un horario" },
     action: {
-      buttons: [
-        {
-          type: "reply",
-          reply: { id: "time_17_00", title: "5:00 PM" }
-        },
-        {
-          type: "reply",
-          reply: { id: "time_17_30", title: "5:30 PM" }
+      buttons: hours.slice(0, 3).map(h => ({
+        type: "reply",
+        reply: {
+          id: `time_${h}`,
+          title: h
         }
-      ]
+      }))
     }
   });
 }
@@ -150,14 +197,12 @@ async function sendTimeButtons(phone) {
 async function sendConfirmation(phone) {
   await sendInteractive(phone, {
     type: "button",
-    body: {
-      text: "✅ Confirm booking?"
-    },
+    body: { text: "✅ ¿Confirmar reserva?" },
     action: {
       buttons: [
         {
           type: "reply",
-          reply: { id: "confirm", title: "Confirm" }
+          reply: { id: "confirm", title: "Confirmar" }
         }
       ]
     }
@@ -166,62 +211,48 @@ async function sendConfirmation(phone) {
 
 /**
  * ============================
- * 6. SEND WHATSAPP MESSAGES
+ * 7. SEND MESSAGES
  * ============================
  */
 async function sendText(phone, text) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: phone,
-        type: "text",
-        text: { body: text }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        }
+  await axios.post(
+    `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to: phone,
+      type: "text",
+      text: { body: text }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
       }
-    );
-  } catch (err) {
-    console.error(
-      "WhatsApp text error:",
-      err.response?.data || err.message
-    );
-  }
+    }
+  );
 }
 
 async function sendInteractive(phone, interactive) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: phone,
-        type: "interactive",
-        interactive
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        }
+  await axios.post(
+    `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to: phone,
+      type: "interactive",
+      interactive
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
       }
-    );
-  } catch (err) {
-    console.error(
-      "WhatsApp interactive error:",
-      err.response?.data || err.message
-    );
-  }
+    }
+  );
 }
 
 /**
  * ============================
- * 7. START SERVER
+ * 8. START SERVER
  * ============================
  */
 app.listen(process.env.PORT || 3000, () => {
