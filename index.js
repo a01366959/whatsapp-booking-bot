@@ -17,48 +17,37 @@ const openai = new OpenAI({
  ******************************************************************/
 const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
 const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
+const DEFAULT_SPORT = "padel";
 
 /******************************************************************
- * 3. IN-MEMORY SESSIONS (CAMBIAR A REDIS EN PRODUCCIÓN)
+ * 3. IN-MEMORY SESSIONS
  ******************************************************************/
 const sessions = new Map();
 
-/*
-Session structure:
-{
-  messages: [ { role, content } ],
-  state: "idle" | "awaiting_date" | "awaiting_time" | "confirming",
-  user: { found, name },
-  date: null,
-  availableHours: [],
-  time: null
-}
-*/
-
 /******************************************************************
- * 4. SYSTEM PROMPT (CEREBRO DEL AGENTE)
+ * 4. SYSTEM PROMPT
  ******************************************************************/
 const SYSTEM_MESSAGE = {
   role: "system",
   content: `
-Eres un asistente humano de WhatsApp para Black Padel & Pickleball en México.
+Eres un recepcionista humano de WhatsApp para Black Padel & Pickleball en México.
 
-OBJETIVO:
-Conversar como recepcionista real, natural y empática.
-
-REGLAS:
-- Nunca hables como bot.
-- Nunca inventes horarios.
-- Toda disponibilidad y reservas vienen de Bubble.
-- Recuerda el contexto de la conversación.
-- Si el usuario pregunta algo distinto, responde naturalmente.
-- Usa botones SOLO para seleccionar horarios.
-- Español mexicano.
+Habla natural, cercano y empático.
+No repitas saludos.
+Nunca hables como bot.
+Ayuda a reservar canchas y resolver dudas.
 `
 };
 
 /******************************************************************
- * 5. BUBBLE WORKFLOWS
+ * 5. HELPERS
+ ******************************************************************/
+function normalizePhone(phone) {
+  return phone.replace(/\D/g, "");
+}
+
+/******************************************************************
+ * 6. BUBBLE WORKFLOWS
  ******************************************************************/
 async function findUser(phone) {
   const res = await axios.get(`${BUBBLE}/find_user`, {
@@ -66,75 +55,78 @@ async function findUser(phone) {
     timeout: 8000
   });
 
-  if (!res.data || res.data.status !== "success" || !res.data.response) {
+  if (!res.data || res.data.status !== "success") {
     return { found: false };
   }
 
-  // Bubble YA devuelve found: true
   return res.data.response;
 }
 
-async function getAvailableHours(date) {
+async function getAvailableHours(sport, date) {
   const res = await axios.get(`${BUBBLE}/get_available_hours`, {
-    params: { date },
+    params: { sport, date },
     timeout: 8000
   });
 
   if (
     !res.data ||
     res.data.status !== "success" ||
-    !Array.isArray(res.data.response?.timeslots)
+    res.data.response?.success !== true ||
+    !Array.isArray(res.data.response?.hours)
   ) {
     throw new Error("Bubble availability error");
   }
 
-  // eliminar duplicados
-  return [...new Set(res.data.response.timeslots)];
+  const unique = [...new Set(res.data.response.hours)];
+
+  unique.sort((a, b) => {
+    const [ha, ma] = a.split(":").map(Number);
+    const [hb, mb] = b.split(":").map(Number);
+    return ha * 60 + ma - (hb * 60 + mb);
+  });
+
+  return unique;
 }
 
 async function confirmBooking(phone, date, time) {
-  await axios.post(
-    `${BUBBLE}/confirm_booking`,
-    { phone, date, time },
-    { timeout: 8000 }
-  );
+  await axios.post(`${BUBBLE}/confirm_booking`, {
+    phone,
+    date,
+    time
+  });
 }
 
 /******************************************************************
- * 6. OPENAI HELPERS
+ * 7. OPENAI HELPERS
  ******************************************************************/
 async function askAI(messages) {
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
     input: messages,
-    temperature: 0.4,
+    temperature: 0.35,
     max_output_tokens: 300
   });
 
   return response.output_text?.trim();
 }
 
-/**
- * 6.1 IA SOLO para parsing de fecha
- */
 async function parseDateWithAI(text) {
   const messages = [
     {
       role: "system",
       content:
-        "Convierte el texto del usuario en una fecha válida. Devuelve SOLO una fecha en formato YYYY-MM-DD o la palabra INVALID."
+        "Extrae una fecha del texto. Devuelve SOLO YYYY-MM-DD o INVALID."
     },
     { role: "user", content: text }
   ];
 
   const result = await askAI(messages);
   if (!result || result.includes("INVALID")) return null;
-
-  return result;
+  return result.trim();
 }
 
 /******************************************************************
- * 7. WHATSAPP SENDERS
+ * 8. WHATSAPP SENDERS
  ******************************************************************/
 function authHeaders() {
   return {
@@ -174,33 +166,19 @@ async function sendButtons(phone, text, options) {
 }
 
 /******************************************************************
- * 8. WEBHOOK VERIFICATION
- ******************************************************************/
-app.get("/webhook", (req, res) => {
-  if (
-    req.query["hub.mode"] === "subscribe" &&
-    req.query["hub.verify_token"] === process.env.WEBHOOK_VERIFY_TOKEN
-  ) {
-    return res.status(200).send(req.query["hub.challenge"]);
-  }
-  res.sendStatus(403);
-});
-
-/******************************************************************
- * 9. MAIN WEBHOOK
+ * 9. WEBHOOK
  ******************************************************************/
 app.post("/webhook", async (req, res) => {
   try {
     const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    const phone = msg.from;
+    const rawPhone = msg.from;
+    const phone = normalizePhone(rawPhone);
     const text = msg.text?.body || "";
     const normalized = text.toLowerCase().trim();
 
-    /**************************************************************
-     * 9.1 SESSION INIT
-     **************************************************************/
+    /**************** SESSION INIT ****************/
     if (!sessions.has(phone)) {
       const user = await findUser(phone);
 
@@ -218,71 +196,47 @@ app.post("/webhook", async (req, res) => {
       } else {
         await sendText(phone, "Hola 👋 ¿Cómo te ayudo hoy?");
       }
+
+      return res.sendStatus(200);
     }
 
     const session = sessions.get(phone);
     session.messages.push({ role: "user", content: text });
 
-    /**************************************************************
-     * 9.2 GLOBAL INTENTS (SIEMPRE ACTIVOS)
-     **************************************************************/
+    /**************** GLOBAL ****************/
     if (normalized.includes("reiniciar")) {
       sessions.delete(phone);
-      await sendText(phone, "Listo, empezamos de nuevo. ¿Qué te gustaría hacer?");
+      await sendText(phone, "Listo, empezamos de nuevo 🙂 ¿Qué te gustaría hacer?");
       return res.sendStatus(200);
     }
 
-    if (
-      normalized.includes("qué más") ||
-      normalized.includes("que mas") ||
-      normalized.includes("ayuda")
-    ) {
-      await sendText(
-        phone,
-        `Puedo ayudarte a:
-- Reservar una cancha
-- Consultar horarios
-- Resolver dudas del club
-
-¿En qué te ayudo ahora?`
-      );
-      return res.sendStatus(200);
-    }
-
-    /**************************************************************
-     * 9.3 RESERVATION FLOW
-     **************************************************************/
-    if (
-      session.state === "idle" &&
-      normalized.includes("reserv")
-    ) {
+    /**************** RESERVA ****************/
+    if (session.state === "idle" && normalized.includes("reserv")) {
       session.state = "awaiting_date";
-      await sendText(phone, "Perfecto. ¿Para qué fecha te gustaría reservar?");
+      await sendText(phone, "Perfecto, ¿para qué fecha te gustaría reservar?");
       return res.sendStatus(200);
     }
 
     if (session.state === "awaiting_date") {
-      const parsedDate = await parseDateWithAI(text);
+      const date = await parseDateWithAI(text);
 
-      if (!parsedDate) {
+      if (!date) {
         await sendText(
           phone,
-          "No entendí bien la fecha. Puedes decir algo como: hoy, mañana, el viernes o 27 de noviembre."
+          "No entendí la fecha 😅 Puedes decir: hoy, mañana, viernes o 27 de noviembre."
         );
         return res.sendStatus(200);
       }
 
-      session.date = parsedDate;
-
-      await sendText(phone, "Dame un momento, estoy revisando los horarios disponibles.");
+      session.date = date;
+      await sendText(phone, "Déjame revisar los horarios disponibles…");
 
       try {
-        session.availableHours = await getAvailableHours(parsedDate);
-      } catch (e) {
-        session.state = "awaiting_date";
+        session.availableHours = await getAvailableHours(DEFAULT_SPORT, date);
+      } catch {
         await sendText(
           phone,
-          "Tuve un problema revisando los horarios. ¿Quieres intentar con otra fecha?"
+          "Tuve un problema consultando los horarios 😕 ¿Intentamos otra fecha?"
         );
         return res.sendStatus(200);
       }
@@ -290,7 +244,7 @@ app.post("/webhook", async (req, res) => {
       if (!session.availableHours.length) {
         await sendText(
           phone,
-          "Ese día ya estamos llenos. Si quieres, puedo revisar otra fecha."
+          "Ese día ya está lleno 😅 Si quieres, revisamos otra fecha."
         );
         return res.sendStatus(200);
       }
@@ -299,8 +253,8 @@ app.post("/webhook", async (req, res) => {
 
       await sendButtons(
         phone,
-        "Estos son los horarios disponibles:",
-        session.availableHours.slice(0, 3).map(h => ({
+        "Estos horarios están disponibles:",
+        session.availableHours.slice(0, 5).map(h => ({
           type: "reply",
           reply: { id: h, title: h }
         }))
@@ -311,10 +265,7 @@ app.post("/webhook", async (req, res) => {
 
     if (session.state === "awaiting_time") {
       if (!session.availableHours.includes(text)) {
-        await sendText(
-          phone,
-          "Ese horario no está disponible. Puedes elegir uno de los botones."
-        );
+        await sendText(phone, "Elige uno de los horarios disponibles 😊");
         return res.sendStatus(200);
       }
 
@@ -323,24 +274,19 @@ app.post("/webhook", async (req, res) => {
 
       await sendText(
         phone,
-        `Perfecto. ¿Confirmo tu reserva el ${session.date} a las ${session.time}?`
+        `¿Confirmo tu reserva el ${session.date} a las ${session.time}?`
       );
       return res.sendStatus(200);
     }
 
-    if (
-      session.state === "confirming" &&
-      normalized.includes("si")
-    ) {
+    if (session.state === "confirming" && normalized.includes("si")) {
       await confirmBooking(phone, session.date, session.time);
-      await sendText(phone, "Listo. Tu reserva quedó confirmada. Te esperamos.");
+      await sendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
       sessions.delete(phone);
       return res.sendStatus(200);
     }
 
-    /**************************************************************
-     * 9.4 GENERAL CHAT (AI CON MEMORIA)
-     **************************************************************/
+    /**************** CHAT GENERAL ****************/
     const aiReply = await askAI(session.messages);
     if (aiReply) {
       session.messages.push({ role: "assistant", content: aiReply });
