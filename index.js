@@ -230,10 +230,18 @@ async function getAvailableHours(date, desiredSport) {
 
 async function confirmBooking(phone, date, time, name, userId, sport) {
   const bubbleDate = toBubbleDate(date);
-  const payload = { phone, date: bubbleDate, hour: time, sport: sport || DEFAULT_SPORT };
-  if (name) payload.name = name;
-  if (userId) payload.user = userId;
-  await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, payload);
+  const basePayload = { phone, date: bubbleDate, hour: time, sport: sport || DEFAULT_SPORT };
+  if (name) basePayload.name = name;
+  const withUser = userId ? { ...basePayload, user: userId } : basePayload;
+  try {
+    await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, withUser);
+  } catch (err) {
+    if (userId) {
+      await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, basePayload);
+      return;
+    }
+    throw err;
+  }
 }
 
 /******************************************************************
