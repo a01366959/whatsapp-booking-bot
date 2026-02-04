@@ -73,6 +73,12 @@ const resolveDate = text => {
   return null;
 };
 
+const toBubbleDate = dateStr => {
+  if (!dateStr) return null;
+  if (dateStr.includes("T")) return dateStr;
+  return `${dateStr}T00:00:00Z`;
+};
+
 const isGreeting = text =>
   /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text);
 
@@ -96,15 +102,17 @@ async function findUser(phone) {
 }
 
 async function getAvailableHours(date) {
+  const bubbleDate = toBubbleDate(date);
   const r = await axios.get(`${BUBBLE}/get_available_hours`, {
-    params: { sport: DEFAULT_SPORT, date }
+    params: { sport: DEFAULT_SPORT, date: bubbleDate }
   });
 
   return [...new Set(r.data.response.hours)].sort();
 }
 
 async function confirmBooking(phone, date, time) {
-  await axios.post(`${BUBBLE}/confirm_booking`, { phone, date, time });
+  const bubbleDate = toBubbleDate(date);
+  await axios.post(`${BUBBLE}/confirm_booking`, { phone, date: bubbleDate, time });
 }
 
 /******************************************************************
