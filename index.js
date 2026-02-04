@@ -24,8 +24,16 @@ const redis = new Redis({
  ******************************************************************/
 const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
 const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
-const DEFAULT_SPORT = "padel";
+const DEFAULT_SPORT = "Padel";
 const MAX_BUTTONS = 3;
+const MEXICO_TZ = "America/Mexico_City";
+
+const bubbleClient = axios.create({
+  baseURL: BUBBLE,
+  headers: {
+    Authorization: `Bearer ${process.env.BUBBLE_TOKEN}`
+  }
+});
 
 /******************************************************************
  * SYSTEM PROMPT (AGENTE)
@@ -45,8 +53,8 @@ REGLAS DURAS:
 - Si necesitas datos, pregunta de forma breve y natural
 
 HERRAMIENTAS:
-- find_user: obtener nombre del cliente por teléfono
-- get_available_hours: horarios disponibles por fecha
+- get_user: obtener nombre del cliente por teléfono
+- get_hours: horarios disponibles por fecha
 
 Usa herramientas cuando ayuden. Si no tienes información, dilo.
 Responde en español, corto y claro.
@@ -56,7 +64,11 @@ Responde en español, corto y claro.
 /******************************************************************
  * HELPERS
  ******************************************************************/
-const normalizePhone = p => p.replace(/\D/g, "");
+const normalizePhone = p => {
+  const digits = p.replace(/\D/g, "");
+  if (digits.length <= 10) return digits;
+  return digits.slice(-10);
+};
 
 const resolveDate = text => {
   const t = text.toLowerCase();
@@ -76,6 +88,24 @@ const toBubbleDate = dateStr => {
   if (!dateStr) return null;
   if (dateStr.includes("T")) return dateStr;
   return `${dateStr}T00:00:00Z`;
+};
+
+const getMexicoDateParts = () => {
+  const dt = new Date();
+  const dateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: MEXICO_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(dt);
+  const hour = Number(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: MEXICO_TZ,
+      hour: "2-digit",
+      hour12: false
+    }).format(dt)
+  );
+  return { dateStr, hour };
 };
 
 const extractTime = text => {
@@ -106,6 +136,31 @@ const formatDateEs = dateStr => {
     timeZone: "UTC"
   }).format(d);
 };
+
+const hourToNumber = timeStr => {
+  const m = timeStr?.match(/^(\d{2}):/);
+  return m ? Number(m[1]) : null;
+};
+
+const suggestClosestHours = (hours, desiredTime) => {
+  if (!hours?.length) return [];
+  const desiredHour = hourToNumber(desiredTime);
+  if (desiredHour === null) return hours.slice(0, MAX_BUTTONS);
+  const sorted = [...hours].sort();
+  const before = [];
+  const after = [];
+  for (const h of sorted) {
+    const hr = hourToNumber(h);
+    if (hr === null) continue;
+    if (hr < desiredHour) before.push(h);
+    else if (hr > desiredHour) after.push(h);
+  }
+  const suggestions = [];
+  if (after.length) suggestions.push(after[0]);
+  if (after.length > 1) suggestions.push(after[1]);
+  if (before.length) suggestions.push(before[before.length - 1]);
+  return [...new Set(suggestions)].slice(0, MAX_BUTTONS);
+};
 /******************************************************************
  * REDIS SESSION
  ******************************************************************/
@@ -121,24 +176,31 @@ const markMessageProcessed = async id =>
  * BUBBLE
  ******************************************************************/
 async function findUser(phone) {
-  const r = await axios.get(`${BUBBLE}/find_user`, { params: { phone } });
+  const r = await bubbleClient.get(`/get_user`, { params: { phone } });
   return r.data?.response || { found: false };
 }
 
-async function getAvailableHours(date) {
+async function getAvailableHours(date, desiredSport) {
   const bubbleDate = toBubbleDate(date);
-  const r = await axios.get(`${BUBBLE}/get_available_hours`, {
-    params: { sport: DEFAULT_SPORT, date: bubbleDate }
+  const { hour } = getMexicoDateParts();
+  const currentTimeNumber = hour;
+  const r = await bubbleClient.get(`/get_hours`, {
+    params: {
+      sport: desiredSport || DEFAULT_SPORT,
+      date: bubbleDate,
+      current_time_number: currentTimeNumber
+    }
   });
 
   return [...new Set(r.data.response.hours)].sort();
 }
 
-async function confirmBooking(phone, date, time, name) {
+async function confirmBooking(phone, date, time, name, userId, sport) {
   const bubbleDate = toBubbleDate(date);
-  const payload = { phone, date: bubbleDate, hour: time };
+  const payload = { phone, date: bubbleDate, hour: time, sport: sport || DEFAULT_SPORT };
   if (name) payload.name = name;
-  await axios.post(`${BUBBLE}/confirm_booking`, payload);
+  if (userId) payload.user = userId;
+  await bubbleClient.post(`/confirm_reserva`, payload);
 }
 
 /******************************************************************
@@ -148,7 +210,7 @@ const TOOLS = [
   {
     type: "function",
     function: {
-      name: "find_user",
+      name: "get_user",
       description: "Buscar usuario por teléfono para obtener nombre.",
       parameters: {
         type: "object",
@@ -161,7 +223,7 @@ const TOOLS = [
   {
     type: "function",
     function: {
-      name: "get_available_hours",
+      name: "get_hours",
       description: "Obtener horarios disponibles para una fecha.",
       parameters: {
         type: "object",
@@ -185,8 +247,10 @@ async function runAgent(session, userText) {
 - phone: ${session.phone}
 - user_found: ${session.user?.found ? "si" : "no"}
 - user_name: ${session.user?.name || "desconocido"}
+- user_id: ${session.user?.id || "desconocido"}
 - date: ${session.date || "null"}
-- hours: ${session.hours?.length ? session.hours.join(", ") : "null"}`
+- hours: ${session.hours?.length ? session.hours.join(", ") : "null"}
+- sport: ${session.sport || DEFAULT_SPORT}`
     },
     ...session.messages
   ];
@@ -225,16 +289,18 @@ async function runAgent(session, userText) {
         }
 
         let result = { ok: false };
-        if (name === "find_user") {
+        if (name === "get_user") {
           result = await findUser(args.phone);
           session.user = result;
-        } else if (name === "get_available_hours") {
+        } else if (name === "get_hours") {
           const date = args.date || session.date;
+          const sport = args.sport || DEFAULT_SPORT;
           if (!date) {
             result = { ok: false, error: "missing_date" };
           } else {
             session.date = date;
-            const hours = await getAvailableHours(date);
+            session.sport = sport;
+            const hours = await getAvailableHours(date, sport);
             session.hours = hours;
             session.hoursSent = false;
             session.justFetchedHours = true;
@@ -347,7 +413,9 @@ app.post("/webhook", async (req, res) => {
       hoursSent: false,
       pendingTime: null,
       pendingConfirm: null,
-      justFetchedHours: false
+      justFetchedHours: false,
+      desiredTime: null,
+      sport: DEFAULT_SPORT
     };
   }
   session.phone = phone;
@@ -366,13 +434,17 @@ app.post("/webhook", async (req, res) => {
     if (d) session.date = d;
   }
 
+  if (!session.user && (hasBookingIntent(text) || session.date || session.pendingTime || session.pendingConfirm)) {
+    session.user = await findUser(phone);
+  }
+
   // Si estamos esperando confirmación final
   if (session.pendingConfirm) {
     if (isYes(normalizedText)) {
       const { date, time, name } = session.pendingConfirm;
       await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…");
       try {
-        await confirmBooking(phone, date, time, name);
+        await confirmBooking(phone, date, time, name, session.user?.id, session.sport);
         await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.");
         await clearSession(phone);
       } catch (err) {
@@ -393,24 +465,41 @@ app.post("/webhook", async (req, res) => {
 
   // Si ya tenemos horarios y el usuario manda una hora, pedir confirmación
   const timeCandidate = extractTime(text);
-  if (timeCandidate && session.hours?.includes(timeCandidate)) {
-    if (!session.user?.name) {
-      session.pendingTime = timeCandidate;
-      await safeSendText(phone, "¿A nombre de quién hago la reserva?");
+  if (timeCandidate) {
+    session.desiredTime = timeCandidate;
+    if (session.hours?.includes(timeCandidate)) {
+      if (!session.user?.name) {
+        session.pendingTime = timeCandidate;
+        await safeSendText(phone, "¿A nombre de quién hago la reserva?");
+        await saveSession(phone, session);
+        return res.sendStatus(200);
+      }
+      session.pendingConfirm = {
+        date: session.date,
+        time: timeCandidate,
+        name: session.user?.name || "Cliente"
+      };
+      await safeSendText(
+        phone,
+        `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${timeCandidate}?`
+      );
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
-    session.pendingConfirm = {
-      date: session.date,
-      time: timeCandidate,
-      name: session.user?.name || "Cliente"
-    };
-    await safeSendText(
-      phone,
-      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${timeCandidate}?`
-    );
-    await saveSession(phone, session);
-    return res.sendStatus(200);
+    if (session.hours?.length) {
+      const suggestions = suggestClosestHours(session.hours, timeCandidate);
+      await safeSendText(
+        phone,
+        `No tengo ${timeCandidate} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
+      );
+      const buttons = suggestions.map(h => ({
+        type: "reply",
+        reply: { id: h, title: h }
+      }));
+      await safeSendButtons(phone, "Selecciona un horario:", buttons);
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
   }
 
   // Si es un saludo inicial, no repetir saludo ni romper el flujo
@@ -449,15 +538,39 @@ app.post("/webhook", async (req, res) => {
 
   // Si acabamos de obtener horarios, enviar solo botones (sin duplicar texto)
   if (session.justFetchedHours && session.hours?.length) {
-    const buttons = session.hours.slice(0, MAX_BUTTONS).map(h => ({
+    const preferred = session.desiredTime;
+    if (preferred && session.hours.includes(preferred)) {
+      session.pendingConfirm = {
+        date: session.date,
+        time: preferred,
+        name: session.user?.name || "Cliente"
+      };
+      await safeSendText(
+        phone,
+        `Tengo ${preferred} disponible. ¿Confirmo a nombre de ${session.pendingConfirm.name}?`
+      );
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
+
+    const suggestions = preferred
+      ? suggestClosestHours(session.hours, preferred)
+      : session.hours.slice(0, MAX_BUTTONS);
+
+    if (preferred) {
+      await safeSendText(
+        phone,
+        `No tengo ${preferred} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
+      );
+    } else {
+      await safeSendText(phone, "¿A qué hora te gustaría reservar?");
+    }
+
+    const buttons = suggestions.map(h => ({
       type: "reply",
       reply: { id: h, title: h }
     }));
-    await safeSendButtons(
-      phone,
-      "Horarios disponibles (elige uno). Si prefieres otra hora, escríbela.",
-      buttons
-    );
+    await safeSendButtons(phone, "Selecciona un horario:", buttons);
     session.hoursSent = true;
     session.messages = messages
       .filter(m => m.role === "user" || m.role === "assistant")
