@@ -366,6 +366,7 @@ app.post("/webhook", async (req, res) => {
     msg.interactive?.button_reply?.title ||
     msg.interactive?.button_reply?.id ||
     "";
+  const normalizedText = text.trim().toLowerCase();
 
   let session = await getSession(phone);
   const isNewSession = !session;
@@ -380,6 +381,13 @@ app.post("/webhook", async (req, res) => {
     };
   }
   session.phone = phone;
+
+  // Reset manual para pruebas
+  if (normalizedText === "reset") {
+    await clearSession(phone);
+    await safeSendText(phone, "Listo, reinicié la conversación.");
+    return res.sendStatus(200);
+  }
 
   // Fecha directa (sin IA)
   if (!session.date) {
