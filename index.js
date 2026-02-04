@@ -27,6 +27,7 @@ const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
 const DEFAULT_SPORT = "Padel";
 const MAX_BUTTONS = 3;
 const MEXICO_TZ = "America/Mexico_City";
+const CONFIRM_ENDPOINT = process.env.BUBBLE_CONFIRM_ENDPOINT || "confirm_reserva";
 
 const bubbleClient = axios.create({
   baseURL: BUBBLE,
@@ -110,10 +111,18 @@ const getMexicoDateParts = () => {
 
 const extractTime = text => {
   const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-  if (!m) return null;
-  const hh = m[1].padStart(2, "0");
-  const mm = m[2];
-  return `${hh}:${mm}`;
+  if (m) {
+    const hh = m[1].padStart(2, "0");
+    const mm = m[2];
+    return `${hh}:${mm}`;
+  }
+  const m2 = text.match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm)?\b/i);
+  if (!m2) return null;
+  let hour = Number(m2[1]);
+  const mer = (m2[2] || "").toLowerCase();
+  if (mer === "pm" && hour < 12) hour += 12;
+  if (mer === "am" && hour === 12) hour = 0;
+  return `${String(hour).padStart(2, "0")}:00`;
 };
 
 const isGreeting = text =>
@@ -122,7 +131,8 @@ const isGreeting = text =>
 const hasBookingIntent = text =>
   /\b(reservar|reserva|agendar|agenda|apart(ar)?|cancha|horario)\b/i.test(text);
 
-const isYes = text => /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante)\b/i.test(text);
+const isYes = text =>
+  /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text);
 const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text);
 
 const formatDateEs = dateStr => {
@@ -200,7 +210,7 @@ async function confirmBooking(phone, date, time, name, userId, sport) {
   const payload = { phone, date: bubbleDate, hour: time, sport: sport || DEFAULT_SPORT };
   if (name) payload.name = name;
   if (userId) payload.user = userId;
-  await bubbleClient.post(`/confirm_reserva`, payload);
+  await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, payload);
 }
 
 /******************************************************************
@@ -252,7 +262,7 @@ async function runAgent(session, userText) {
 - hours: ${session.hours?.length ? session.hours.join(", ") : "null"}
 - sport: ${session.sport || DEFAULT_SPORT}`
     },
-    ...session.messages
+    ...session.messages.filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
   ];
 
   const messages = [...context, { role: "user", content: userText }];
@@ -557,23 +567,17 @@ app.post("/webhook", async (req, res) => {
       ? suggestClosestHours(session.hours, preferred)
       : session.hours.slice(0, MAX_BUTTONS);
 
-    if (preferred) {
-      await safeSendText(
-        phone,
-        `No tengo ${preferred} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
-      );
-    } else {
-      await safeSendText(phone, "¿A qué hora te gustaría reservar?");
-    }
-
     const buttons = suggestions.map(h => ({
       type: "reply",
       reply: { id: h, title: h }
     }));
-    await safeSendButtons(phone, "Selecciona un horario:", buttons);
+    const buttonText = preferred
+      ? `No tengo ${preferred} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
+      : "¿A qué hora te gustaría reservar?";
+    await safeSendButtons(phone, buttonText, buttons);
     session.hoursSent = true;
     session.messages = messages
-      .filter(m => m.role === "user" || m.role === "assistant")
+      .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
       .slice(-12);
     await saveSession(phone, session);
     return res.sendStatus(200);
@@ -582,7 +586,7 @@ app.post("/webhook", async (req, res) => {
   await safeSendText(phone, finalText);
 
   session.messages = messages
-    .filter(m => m.role === "user" || m.role === "assistant")
+    .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
     .slice(-12);
 
   await saveSession(phone, session);
