@@ -31,6 +31,15 @@ const normalizeBubbleBase = raw => {
   if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
   base = base.replace(/^http:\/\//i, "https://");
   base = base.replace(/\/api\/1\.1\/wf$/i, "");
+  try {
+    const u = new URL(base);
+    if (u.hostname === "blackpadel.com.mx") {
+      u.hostname = "www.blackpadel.com.mx";
+    }
+    base = u.toString().replace(/\/$/, "");
+  } catch {
+    // ignore
+  }
   return `${base}/api/1.1/wf`;
 };
 const BUBBLE = normalizeBubbleBase(RAW_BUBBLE_BASE);
