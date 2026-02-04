@@ -5,6 +5,7 @@ import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
 import { Redis } from "@upstash/redis";
+import { randomUUID } from "crypto";
 
 const app = express();
 app.use(express.json());
@@ -23,7 +24,13 @@ const redis = new Redis({
  * CONSTANTS
  ******************************************************************/
 const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
-const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
+const RAW_BUBBLE_BASE = process.env.BUBBLE_BASE_URL || "";
+const BUBBLE_BASE_URL = RAW_BUBBLE_BASE.startsWith("http://")
+  ? RAW_BUBBLE_BASE.replace(/^http:\/\//, "https://")
+  : RAW_BUBBLE_BASE.startsWith("https://")
+    ? RAW_BUBBLE_BASE
+    : `https://${RAW_BUBBLE_BASE}`;
+const BUBBLE = `${BUBBLE_BASE_URL}/api/1.1/wf`;
 const DEFAULT_SPORT = "Padel";
 const MAX_BUTTONS = 3;
 const MEXICO_TZ = "America/Mexico_City";
@@ -134,6 +141,10 @@ const hasBookingIntent = text =>
 const isYes = text =>
   /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text);
 const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text);
+const wantsOtherTimes = text =>
+  /\b(otra\s+hora|otras\s+horas|que\s+otra|qué\s+otra|opciones|alternativas|diferente|más\s+tarde|mas\s+tarde|más\s+temprano|mas\s+temprano)\b/i.test(
+    text
+  );
 
 const formatDateEs = dateStr => {
   if (!dateStr) return "";
@@ -180,7 +191,19 @@ const saveSession = (phone, session) =>
 const clearSession = phone => redis.del(`session:${phone}`);
 
 const markMessageProcessed = async id =>
-  redis.set(`msg:${id}`, 1, { nx: true, ex: 3600 });
+  redis.set(`msg:${id}`, 1, { nx: true, ex: 86400 });
+
+const getFlowToken = phone => redis.get(`flow:${phone}`);
+const setFlowToken = (phone, token) =>
+  redis.set(`flow:${phone}`, token, { ex: 86400 });
+const ensureFlowToken = async phone => {
+  let token = await getFlowToken(phone);
+  if (!token) {
+    token = randomUUID();
+    await setFlowToken(phone, token);
+  }
+  return token;
+};
 
 /******************************************************************
  * BUBBLE
@@ -366,8 +389,12 @@ const sendButtons = (to, text, buttons) =>
     { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
   );
 
-async function safeSendText(to, text) {
+async function safeSendText(to, text, flowToken) {
   if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current !== flowToken) return { ok: false, error: "stale_flow" };
+  }
   try {
     await sendText(to, text);
     return { ok: true };
@@ -377,8 +404,12 @@ async function safeSendText(to, text) {
   }
 }
 
-async function safeSendButtons(to, text, buttons) {
+async function safeSendButtons(to, text, buttons, flowToken) {
   if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current !== flowToken) return { ok: false, error: "stale_flow" };
+  }
   try {
     await sendButtons(to, text, buttons);
     return { ok: true };
@@ -409,6 +440,9 @@ app.post("/webhook", async (req, res) => {
     msg.interactive?.button_reply?.id ||
     "";
   const normalizedText = text.trim().toLowerCase();
+  const msgTs = Number(msg.timestamp || 0);
+
+  const flowToken = await ensureFlowToken(phone);
 
   let session = await getSession(phone);
   const isNewSession = !session;
@@ -425,16 +459,24 @@ app.post("/webhook", async (req, res) => {
       pendingConfirm: null,
       justFetchedHours: false,
       desiredTime: null,
-      sport: DEFAULT_SPORT
+      sport: DEFAULT_SPORT,
+      lastTs: 0
     };
   }
   session.phone = phone;
   session.justFetchedHours = false;
 
+  if (msgTs && session.lastTs && msgTs < session.lastTs) {
+    return res.sendStatus(200);
+  }
+  if (msgTs) session.lastTs = msgTs;
+
   // Reset manual para pruebas
   if (normalizedText === "reset") {
+    const newToken = randomUUID();
+    await setFlowToken(phone, newToken);
     await clearSession(phone);
-    await safeSendText(phone, "Listo, reinicié la conversación.");
+    await safeSendText(phone, "Listo, reinicié la conversación.", newToken);
     return res.sendStatus(200);
   }
 
@@ -448,18 +490,52 @@ app.post("/webhook", async (req, res) => {
     session.user = await findUser(phone);
   }
 
+  // Si el usuario pide otras horas y ya tenemos horarios, responder con opciones
+  if (session.hours?.length && wantsOtherTimes(normalizedText)) {
+    const base = session.desiredTime || null;
+    const suggestions = base
+      ? suggestClosestHours(session.hours, base)
+      : session.hours.slice(0, MAX_BUTTONS);
+    const buttons = suggestions.map(h => ({
+      type: "reply",
+      reply: { id: h, title: h }
+    }));
+    const msgText = base
+      ? `Te puedo ofrecer: ${suggestions.join(", ")}.`
+      : "Opciones disponibles:";
+    await safeSendButtons(phone, msgText, buttons, flowToken);
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
+
   // Si estamos esperando confirmación final
   if (session.pendingConfirm) {
     if (isYes(normalizedText)) {
       const { date, time, name } = session.pendingConfirm;
-      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…");
+      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…", flowToken);
       try {
         await confirmBooking(phone, date, time, name, session.user?.id, session.sport);
-        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.");
+        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
         await clearSession(phone);
       } catch (err) {
         console.error("confirmBooking failed", err?.response?.data || err?.message || err);
-        await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?");
+        const suggestions = session.hours?.length
+          ? suggestClosestHours(session.hours, time)
+          : [];
+        if (suggestions.length) {
+          const buttons = suggestions.map(h => ({
+            type: "reply",
+            reply: { id: h, title: h }
+          }));
+          await safeSendButtons(
+            phone,
+            `No pude confirmar. Te puedo ofrecer: ${suggestions.join(", ")}.`,
+            buttons,
+            flowToken
+          );
+        } else {
+          await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
+        }
         session.pendingConfirm = null;
         await saveSession(phone, session);
       }
@@ -467,7 +543,7 @@ app.post("/webhook", async (req, res) => {
     }
     if (isNo(normalizedText)) {
       session.pendingConfirm = null;
-      await safeSendText(phone, "Entendido. ¿Qué horario prefieres?");
+      await safeSendText(phone, "Entendido. ¿Qué horario prefieres?", flowToken);
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
@@ -479,34 +555,36 @@ app.post("/webhook", async (req, res) => {
     session.desiredTime = timeCandidate;
     if (session.hours?.includes(timeCandidate)) {
       if (!session.user?.name) {
-        session.pendingTime = timeCandidate;
-        await safeSendText(phone, "¿A nombre de quién hago la reserva?");
-        await saveSession(phone, session);
-        return res.sendStatus(200);
-      }
+      session.pendingTime = timeCandidate;
+      await safeSendText(phone, "¿A nombre de quién hago la reserva?", flowToken);
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
       session.pendingConfirm = {
         date: session.date,
         time: timeCandidate,
         name: session.user?.name || "Cliente"
       };
-      await safeSendText(
-        phone,
-        `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${timeCandidate}?`
-      );
-      await saveSession(phone, session);
-      return res.sendStatus(200);
-    }
+    await safeSendText(
+      phone,
+      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${timeCandidate}?`,
+      flowToken
+    );
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
     if (session.hours?.length) {
       const suggestions = suggestClosestHours(session.hours, timeCandidate);
       await safeSendText(
         phone,
-        `No tengo ${timeCandidate} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
+        `No tengo ${timeCandidate} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`,
+        flowToken
       );
       const buttons = suggestions.map(h => ({
         type: "reply",
         reply: { id: h, title: h }
       }));
-      await safeSendButtons(phone, "Selecciona un horario:", buttons);
+      await safeSendButtons(phone, "Selecciona un horario:", buttons, flowToken);
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
@@ -519,7 +597,8 @@ app.post("/webhook", async (req, res) => {
     }
     await safeSendText(
       phone,
-      session.user?.found ? `Hola ${session.user.name} 👋 ¿Cómo te ayudo?` : "Hola 👋 ¿Cómo te ayudo?"
+      session.user?.found ? `Hola ${session.user.name} 👋 ¿Cómo te ayudo?` : "Hola 👋 ¿Cómo te ayudo?",
+      flowToken
     );
     session.messages.push({ role: "assistant", content: "saludo" });
     await saveSession(phone, session);
@@ -538,7 +617,8 @@ app.post("/webhook", async (req, res) => {
     session.pendingTime = null;
     await safeSendText(
       phone,
-      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${session.pendingConfirm.time}?`
+      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${session.pendingConfirm.time}?`,
+      flowToken
     );
     await saveSession(phone, session);
     return res.sendStatus(200);
@@ -557,7 +637,8 @@ app.post("/webhook", async (req, res) => {
       };
       await safeSendText(
         phone,
-        `Tengo ${preferred} disponible. ¿Confirmo a nombre de ${session.pendingConfirm.name}?`
+        `Tengo ${preferred} disponible. ¿Confirmo a nombre de ${session.pendingConfirm.name}?`,
+        flowToken
       );
       await saveSession(phone, session);
       return res.sendStatus(200);
@@ -574,7 +655,7 @@ app.post("/webhook", async (req, res) => {
     const buttonText = preferred
       ? `No tengo ${preferred} disponible. Te puedo ofrecer: ${suggestions.join(", ")}.`
       : "¿A qué hora te gustaría reservar?";
-    await safeSendButtons(phone, buttonText, buttons);
+    await safeSendButtons(phone, buttonText, buttons, flowToken);
     session.hoursSent = true;
     session.messages = messages
       .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
@@ -583,7 +664,7 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
-  await safeSendText(phone, finalText);
+  await safeSendText(phone, finalText, flowToken);
 
   session.messages = messages
     .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
