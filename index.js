@@ -25,6 +25,7 @@ const redis = new Redis({
 const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
 const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
 const DEFAULT_SPORT = "padel";
+const MAX_BUTTONS = 3;
 
 /******************************************************************
  * SYSTEM PROMPT (AGENTE)
@@ -77,6 +78,14 @@ const toBubbleDate = dateStr => {
   if (!dateStr) return null;
   if (dateStr.includes("T")) return dateStr;
   return `${dateStr}T00:00:00Z`;
+};
+
+const extractTime = text => {
+  const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (!m) return null;
+  const hh = m[1].padStart(2, "0");
+  const mm = m[2];
+  return `${hh}:${mm}`;
 };
 
 const isGreeting = text =>
@@ -248,6 +257,7 @@ async function runAgent(session, userText) {
             session.date = date;
             const hours = await getAvailableHours(date);
             session.hours = hours;
+            session.hoursSent = false;
             result = { ok: true, date, hours };
           }
         } else if (name === "confirm_booking") {
@@ -263,7 +273,7 @@ async function runAgent(session, userText) {
             result = { ok: true };
           }
         } else if (name === "send_buttons") {
-          const buttons = (args.buttons || []).slice(0, 5);
+          const buttons = (args.buttons || []).slice(0, MAX_BUTTONS);
           if (buttons.length) {
             await safeSendButtons(
               session.phone,
@@ -377,7 +387,8 @@ app.post("/webhook", async (req, res) => {
       messages: [],
       user: null,
       date: null,
-      hours: null
+      hours: null,
+      hoursSent: false
     };
   }
   session.phone = phone;
@@ -395,9 +406,25 @@ app.post("/webhook", async (req, res) => {
     if (d) session.date = d;
   }
 
+  // Si ya tenemos horarios y el usuario manda una hora, confirmar directo
+  const timeCandidate = extractTime(text);
+  if (timeCandidate && session.hours?.includes(timeCandidate)) {
+    await confirmBooking(phone, session.date, timeCandidate);
+    await safeSendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
+    await clearSession(phone);
+    return res.sendStatus(200);
+  }
+
   // Si es un saludo inicial, no repetir saludo ni romper el flujo
   if (isNewSession && isGreeting(text)) {
-    session.messages.push({ role: "user", content: text });
+    if (!session.user) {
+      session.user = await findUser(phone);
+    }
+    await safeSendText(
+      phone,
+      session.user?.found ? `Hola ${session.user.name} 👋 ¿Cómo te ayudo?` : "Hola 👋 ¿Cómo te ayudo?"
+    );
+    session.messages.push({ role: "assistant", content: "saludo" });
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
@@ -409,6 +436,20 @@ app.post("/webhook", async (req, res) => {
   session.messages = messages
     .filter(m => m.role === "user" || m.role === "assistant")
     .slice(-12);
+
+  // Si ya hay horarios pero no se enviaron botones, enviarlos en automático
+  if (session.hours?.length && !session.hoursSent) {
+    const buttons = session.hours.slice(0, MAX_BUTTONS).map(h => ({
+      type: "reply",
+      reply: { id: h, title: h }
+    }));
+    await safeSendButtons(
+      phone,
+      "Horarios disponibles (elige uno):",
+      buttons
+    );
+    session.hoursSent = true;
+  }
 
   await saveSession(phone, session);
   res.sendStatus(200);
