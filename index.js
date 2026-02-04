@@ -47,8 +47,6 @@ REGLAS DURAS:
 HERRAMIENTAS:
 - find_user: obtener nombre del cliente por teléfono
 - get_available_hours: horarios disponibles por fecha
-- confirm_booking: confirmar una reserva
-- send_buttons: mostrar botones en WhatsApp (máx 5)
 
 Usa herramientas cuando ayuden. Si no tienes información, dilo.
 Responde en español, corto y claro.
@@ -94,6 +92,20 @@ const isGreeting = text =>
 const hasBookingIntent = text =>
   /\b(reservar|reserva|agendar|agenda|apart(ar)?|cancha|horario)\b/i.test(text);
 
+const isYes = text => /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante)\b/i.test(text);
+const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text);
+
+const formatDateEs = dateStr => {
+  if (!dateStr) return "";
+  const d = new Date(dateStr.includes("T") ? dateStr : `${dateStr}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return dateStr;
+  return new Intl.DateTimeFormat("es-MX", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC"
+  }).format(d);
+};
 /******************************************************************
  * REDIS SESSION
  ******************************************************************/
@@ -162,44 +174,6 @@ const TOOLS = [
       }
     }
   },
-  {
-    type: "function",
-    function: {
-      name: "confirm_booking",
-      description: "Confirmar una reserva para un teléfono, fecha y hora.",
-      parameters: {
-        type: "object",
-        properties: {
-          phone: { type: "string" },
-          date: { type: "string", description: "YYYY-MM-DD" },
-          time: { type: "string", description: "HH:MM" }
-        },
-        required: ["phone", "date", "time"],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "send_buttons",
-      description: "Enviar botones interactivos (máximo 5).",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string" },
-          buttons: {
-            type: "array",
-            items: { type: "string" },
-            minItems: 1,
-            maxItems: 5
-          }
-        },
-        required: ["text", "buttons"],
-        additionalProperties: false
-      }
-    }
-  }
 ];
 
 async function runAgent(session, userText) {
@@ -265,30 +239,6 @@ async function runAgent(session, userText) {
             session.hoursSent = false;
             session.justFetchedHours = true;
             result = { ok: true, date, hours };
-          }
-        } else if (name === "confirm_booking") {
-          const date = args.date || session.date;
-          const time = args.time;
-          const phone = args.phone || session.phone;
-          if (!date || !time) {
-            result = { ok: false, error: "missing_date_or_time" };
-          } else if (session.hours?.length && !session.hours.includes(time)) {
-            result = { ok: false, error: "time_not_available", hours: session.hours };
-          } else {
-            await confirmBooking(phone, date, time);
-            result = { ok: true };
-          }
-        } else if (name === "send_buttons") {
-          const buttons = (args.buttons || []).slice(0, MAX_BUTTONS);
-          if (buttons.length) {
-            await safeSendButtons(
-              session.phone,
-              args.text || "Selecciona una opción:",
-              buttons.map(h => ({ type: "reply", reply: { id: h, title: h } }))
-            );
-            result = { ok: true };
-          } else {
-            result = { ok: false, error: "no_buttons" };
           }
         } else {
           result = { ok: false, error: "unknown_tool" };
@@ -396,6 +346,7 @@ app.post("/webhook", async (req, res) => {
       hours: null,
       hoursSent: false,
       pendingTime: null,
+      pendingConfirm: null,
       justFetchedHours: false
     };
   }
@@ -415,7 +366,32 @@ app.post("/webhook", async (req, res) => {
     if (d) session.date = d;
   }
 
-  // Si ya tenemos horarios y el usuario manda una hora, confirmar directo
+  // Si estamos esperando confirmación final
+  if (session.pendingConfirm) {
+    if (isYes(normalizedText)) {
+      const { date, time, name } = session.pendingConfirm;
+      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…");
+      try {
+        await confirmBooking(phone, date, time, name);
+        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.");
+        await clearSession(phone);
+      } catch (err) {
+        console.error("confirmBooking failed", err?.response?.data || err?.message || err);
+        await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?");
+        session.pendingConfirm = null;
+        await saveSession(phone, session);
+      }
+      return res.sendStatus(200);
+    }
+    if (isNo(normalizedText)) {
+      session.pendingConfirm = null;
+      await safeSendText(phone, "Entendido. ¿Qué horario prefieres?");
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
+  }
+
+  // Si ya tenemos horarios y el usuario manda una hora, pedir confirmación
   const timeCandidate = extractTime(text);
   if (timeCandidate && session.hours?.includes(timeCandidate)) {
     if (!session.user?.name) {
@@ -424,9 +400,16 @@ app.post("/webhook", async (req, res) => {
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
-    await confirmBooking(phone, session.date, timeCandidate, session.user?.name);
-    await safeSendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
-    await clearSession(phone);
+    session.pendingConfirm = {
+      date: session.date,
+      time: timeCandidate,
+      name: session.user?.name || "Cliente"
+    };
+    await safeSendText(
+      phone,
+      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${timeCandidate}?`
+    );
+    await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
@@ -448,39 +431,46 @@ app.post("/webhook", async (req, res) => {
   if (session.pendingTime) {
     session.user = session.user || { found: false };
     session.user.name = text.trim();
-    await confirmBooking(phone, session.date, session.pendingTime, session.user?.name);
-    await safeSendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
-    await clearSession(phone);
+    session.pendingConfirm = {
+      date: session.date,
+      time: session.pendingTime,
+      name: session.user?.name || "Cliente"
+    };
+    session.pendingTime = null;
+    await safeSendText(
+      phone,
+      `Confirmo a nombre de ${session.pendingConfirm.name} el ${formatDateEs(session.date)} a las ${session.pendingConfirm.time}?`
+    );
+    await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
   const { finalText, messages } = await runAgent(session, text);
 
-  const shouldSendText =
-    !session.justFetchedHours &&
-    !(session.hours?.length && !session.hoursSent);
-
-  if (shouldSendText) {
-    await safeSendText(phone, finalText);
-  }
-
-  session.messages = messages
-    .filter(m => m.role === "user" || m.role === "assistant")
-    .slice(-12);
-
-  // Si ya hay horarios pero no se enviaron botones, enviarlos en automático
-  if (session.hours?.length && !session.hoursSent) {
+  // Si acabamos de obtener horarios, enviar solo botones (sin duplicar texto)
+  if (session.justFetchedHours && session.hours?.length) {
     const buttons = session.hours.slice(0, MAX_BUTTONS).map(h => ({
       type: "reply",
       reply: { id: h, title: h }
     }));
     await safeSendButtons(
       phone,
-      "Horarios disponibles (elige uno):",
+      "Horarios disponibles (elige uno). Si prefieres otra hora, escríbela.",
       buttons
     );
     session.hoursSent = true;
+    session.messages = messages
+      .filter(m => m.role === "user" || m.role === "assistant")
+      .slice(-12);
+    await saveSession(phone, session);
+    return res.sendStatus(200);
   }
+
+  await safeSendText(phone, finalText);
+
+  session.messages = messages
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .slice(-12);
 
   await saveSession(phone, session);
   res.sendStatus(200);
