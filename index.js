@@ -27,7 +27,7 @@ const BUBBLE = `${process.env.BUBBLE_BASE_URL}/api/1.1/wf`;
 const DEFAULT_SPORT = "padel";
 
 /******************************************************************
- * SYSTEM PROMPT (BLINDADO)
+ * SYSTEM PROMPT (AGENTE)
  ******************************************************************/
 const SYSTEM_MESSAGE = {
   role: "system",
@@ -41,13 +41,16 @@ REGLAS DURAS:
 - Si preguntan algo fuera del club, responde educadamente que solo ayudas con temas del club
 - Si ya hay fecha, NO la pidas otra vez
 - Si ya hay horarios, NO preguntes horas
+- Si necesitas datos, pregunta de forma breve y natural
 
-RESPONDE SOLO JSON:
-{
-  "intent": "reserve | general",
-  "reply": "mensaje natural",
-  "time": "HH:MM | null"
-}
+HERRAMIENTAS:
+- find_user: obtener nombre del cliente por teléfono
+- get_available_hours: horarios disponibles por fecha
+- confirm_booking: confirmar una reserva
+- send_buttons: mostrar botones en WhatsApp (máx 5)
+
+Usa herramientas cuando ayuden. Si no tienes información, dilo.
+Responde en español, corto y claro.
 `
 };
 
@@ -59,16 +62,19 @@ const normalizePhone = p => p.replace(/\D/g, "");
 const resolveDate = text => {
   const t = text.toLowerCase();
   const today = new Date();
-  today.setHours(0,0,0,0);
+  today.setHours(0, 0, 0, 0);
 
-  if (t.includes("hoy")) return today.toISOString().slice(0,10);
+  if (t.includes("hoy")) return today.toISOString().slice(0, 10);
   if (t.includes("mañana") || t.includes("manana")) {
     const d = new Date(today);
     d.setDate(d.getDate() + 1);
-    return d.toISOString().slice(0,10);
+    return d.toISOString().slice(0, 10);
   }
   return null;
 };
+
+const isGreeting = text =>
+  /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text);
 
 /******************************************************************
  * REDIS SESSION
@@ -78,17 +84,20 @@ const saveSession = (phone, session) =>
   redis.set(`session:${phone}`, session, { ex: 1800 });
 const clearSession = phone => redis.del(`session:${phone}`);
 
+const markMessageProcessed = async id =>
+  redis.set(`msg:${id}`, 1, { nx: true, ex: 3600 });
+
 /******************************************************************
  * BUBBLE
  ******************************************************************/
 async function findUser(phone) {
-  const r = await axios.get(`${BUBBLE}/find_user`, { params:{ phone }});
-  return r.data?.response || { found:false };
+  const r = await axios.get(`${BUBBLE}/find_user`, { params: { phone } });
+  return r.data?.response || { found: false };
 }
 
 async function getAvailableHours(date) {
   const r = await axios.get(`${BUBBLE}/get_available_hours`, {
-    params:{ sport: DEFAULT_SPORT, date }
+    params: { sport: DEFAULT_SPORT, date }
   });
 
   return [...new Set(r.data.response.hours)].sort();
@@ -99,73 +108,247 @@ async function confirmBooking(phone, date, time) {
 }
 
 /******************************************************************
- * OPENAI
+ * OPENAI (AGENT LOOP)
  ******************************************************************/
-async function askAgent(messages) {
-  const r = await openai.responses.create({
-    model: "gpt-4.1-mini",
-    input: messages,
-    temperature: 0.25,
-    max_output_tokens: 250
-  });
-
-  try {
-    return JSON.parse(r.output_text);
-  } catch {
-    return { intent:"general", reply:"¿Te ayudo con una reserva o información del club?" };
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "find_user",
+      description: "Buscar usuario por teléfono para obtener nombre.",
+      parameters: {
+        type: "object",
+        properties: { phone: { type: "string" } },
+        required: ["phone"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_available_hours",
+      description: "Obtener horarios disponibles para una fecha.",
+      parameters: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "YYYY-MM-DD" },
+          sport: { type: "string" }
+        },
+        required: ["date"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_booking",
+      description: "Confirmar una reserva para un teléfono, fecha y hora.",
+      parameters: {
+        type: "object",
+        properties: {
+          phone: { type: "string" },
+          date: { type: "string", description: "YYYY-MM-DD" },
+          time: { type: "string", description: "HH:MM" }
+        },
+        required: ["phone", "date", "time"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_buttons",
+      description: "Enviar botones interactivos (máximo 5).",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          buttons: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 1,
+            maxItems: 5
+          }
+        },
+        required: ["text", "buttons"],
+        additionalProperties: false
+      }
+    }
   }
+];
+
+async function runAgent(session, userText) {
+  const context = [
+    SYSTEM_MESSAGE,
+    {
+      role: "system",
+      content: `Contexto actual:
+- phone: ${session.phone}
+- user_found: ${session.user?.found ? "si" : "no"}
+- user_name: ${session.user?.name || "desconocido"}
+- date: ${session.date || "null"}
+- hours: ${session.hours?.length ? session.hours.join(", ") : "null"}`
+    },
+    ...session.messages
+  ];
+
+  const messages = [...context, { role: "user", content: userText }];
+  let finalText = null;
+  let guard = 0;
+
+  while (!finalText && guard < 4) {
+    guard += 1;
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages,
+      tools: TOOLS,
+      tool_choice: "auto",
+      temperature: 0.2
+    });
+
+    const msg = response.choices[0]?.message;
+    if (!msg) break;
+
+    if (msg.tool_calls?.length) {
+      messages.push({
+        role: "assistant",
+        content: msg.content ?? "",
+        tool_calls: msg.tool_calls
+      });
+
+      for (const call of msg.tool_calls) {
+        const name = call.function.name;
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || "{}");
+        } catch {
+          args = {};
+        }
+
+        let result = { ok: false };
+        if (name === "find_user") {
+          result = await findUser(args.phone);
+          session.user = result;
+        } else if (name === "get_available_hours") {
+          const date = args.date || session.date;
+          if (!date) {
+            result = { ok: false, error: "missing_date" };
+          } else {
+            session.date = date;
+            const hours = await getAvailableHours(date);
+            session.hours = hours;
+            result = { ok: true, date, hours };
+          }
+        } else if (name === "confirm_booking") {
+          const date = args.date || session.date;
+          const time = args.time;
+          const phone = args.phone || session.phone;
+          if (!date || !time) {
+            result = { ok: false, error: "missing_date_or_time" };
+          } else if (session.hours?.length && !session.hours.includes(time)) {
+            result = { ok: false, error: "time_not_available", hours: session.hours };
+          } else {
+            await confirmBooking(phone, date, time);
+            result = { ok: true };
+          }
+        } else if (name === "send_buttons") {
+          const buttons = (args.buttons || []).slice(0, 5);
+          if (buttons.length) {
+            await sendButtons(
+              session.phone,
+              args.text || "Selecciona una opción:",
+              buttons.map(h => ({ type: "reply", reply: { id: h, title: h } }))
+            );
+            result = { ok: true };
+          } else {
+            result = { ok: false, error: "no_buttons" };
+          }
+        } else {
+          result = { ok: false, error: "unknown_tool" };
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify(result)
+        });
+      }
+    } else {
+      finalText = msg.content?.trim() || "¿Te ayudo con algo del club?";
+      messages.push({ role: "assistant", content: finalText });
+    }
+  }
+
+  return { finalText: finalText || "¿Te ayudo con algo del club?", messages };
 }
 
 /******************************************************************
  * WHATSAPP
  ******************************************************************/
-const sendText = (to,text)=>axios.post(WHATSAPP_API,{
-  messaging_product:"whatsapp",
-  to,
-  type:"text",
-  text:{ body:text }
-},{ headers:{ Authorization:`Bearer ${process.env.WHATSAPP_TOKEN}` }});
+const sendText = (to, text) =>
+  axios.post(
+    WHATSAPP_API,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text }
+    },
+    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
+  );
 
-const sendButtons = (to,text,buttons)=>axios.post(WHATSAPP_API,{
-  messaging_product:"whatsapp",
-  to,
-  type:"interactive",
-  interactive:{
-    type:"button",
-    body:{ text },
-    action:{ buttons }
-  }
-},{ headers:{ Authorization:`Bearer ${process.env.WHATSAPP_TOKEN}` }});
+const sendButtons = (to, text, buttons) =>
+  axios.post(
+    WHATSAPP_API,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text },
+        action: { buttons }
+      }
+    },
+    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
+  );
 
 /******************************************************************
  * WEBHOOK
  ******************************************************************/
-app.post("/webhook", async (req,res)=>{
+app.post("/webhook", async (req, res) => {
   const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
   if (!msg) return res.sendStatus(200);
 
-  const phone = normalizePhone(msg.from);
-  const text = msg.text?.body || "";
-
-  let session = await getSession(phone);
-
-  if (!session) {
-    const user = await findUser(phone);
-    session = {
-      messages:[SYSTEM_MESSAGE],
-      user,
-      date:null,
-      hours:null,
-      fetched:false
-    };
-
-    await sendText(
-      phone,
-      user.found ? `Hola ${user.name} 👋 ¿Cómo te ayudo hoy?` : "Hola 👋 ¿Cómo te ayudo hoy?"
-    );
+  const msgId = msg.id;
+  if (msgId) {
+    const firstTime = await markMessageProcessed(msgId);
+    if (!firstTime) return res.sendStatus(200);
   }
 
-  session.messages.push({ role:"user", content:text });
+  const phone = normalizePhone(msg.from);
+  const text =
+    msg.text?.body ||
+    msg.button?.text ||
+    msg.interactive?.button_reply?.title ||
+    msg.interactive?.button_reply?.id ||
+    "";
+
+  let session = await getSession(phone);
+  const isNewSession = !session;
+
+  if (!session) {
+    session = {
+      phone,
+      messages: [],
+      user: null,
+      date: null,
+      hours: null
+    };
+  }
 
   // Fecha directa (sin IA)
   if (!session.date) {
@@ -173,38 +356,20 @@ app.post("/webhook", async (req,res)=>{
     if (d) session.date = d;
   }
 
-  const agent = await askAgent(session.messages);
-
-  // === SI YA TENEMOS FECHA → MOSTRAR HORARIOS UNA VEZ ===
-  if (session.date && !session.fetched) {
-    session.fetched = true;
-    await sendText(phone,"Déjame revisar los horarios disponibles…");
-    session.hours = await getAvailableHours(session.date);
-
-    await sendButtons(
-      phone,
-      "Estos horarios están disponibles:",
-      session.hours.slice(0,5).map(h=>({
-        type:"reply",
-        reply:{ id:h, title:h }
-      }))
-    );
-
+  // Si es un saludo inicial, no repetir saludo ni romper el flujo
+  if (isNewSession && isGreeting(text)) {
+    session.messages.push({ role: "user", content: text });
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
-  // === CONFIRMAR ===
-  if (session.hours?.includes(agent.time)) {
-    await confirmBooking(phone, session.date, agent.time);
-    await sendText(phone,"¡Listo! Tu reserva quedó confirmada 🙌");
-    await clearSession(phone);
-    return res.sendStatus(200);
-  }
+  const { finalText, messages } = await runAgent(session, text);
 
-  // === CHAT GENERAL CONTROLADO ===
-  await sendText(phone, agent.reply);
-  session.messages.push({ role:"assistant", content:agent.reply });
+  await sendText(phone, finalText);
+
+  session.messages = messages
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .slice(-12);
 
   await saveSession(phone, session);
   res.sendStatus(200);
@@ -213,6 +378,6 @@ app.post("/webhook", async (req,res)=>{
 /******************************************************************
  * SERVER
  ******************************************************************/
-app.listen(process.env.PORT || 3000,()=>{
+app.listen(process.env.PORT || 3000, () => {
   console.log("FULL AI AGENT RUNNING (REDIS)");
 });
