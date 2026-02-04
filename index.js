@@ -136,7 +136,7 @@ async function getAvailableHours(date) {
 
 async function confirmBooking(phone, date, time, name) {
   const bubbleDate = toBubbleDate(date);
-  const payload = { phone, date: bubbleDate, time };
+  const payload = { phone, date: bubbleDate, hour: time };
   if (name) payload.name = name;
   await axios.post(`${BUBBLE}/confirm_booking`, payload);
 }
