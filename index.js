@@ -91,6 +91,9 @@ const extractTime = text => {
 const isGreeting = text =>
   /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text);
 
+const hasBookingIntent = text =>
+  /\b(reservar|reserva|agendar|agenda|apart(ar)?|cancha|horario)\b/i.test(text);
+
 /******************************************************************
  * REDIS SESSION
  ******************************************************************/
@@ -119,9 +122,11 @@ async function getAvailableHours(date) {
   return [...new Set(r.data.response.hours)].sort();
 }
 
-async function confirmBooking(phone, date, time) {
+async function confirmBooking(phone, date, time, name) {
   const bubbleDate = toBubbleDate(date);
-  await axios.post(`${BUBBLE}/confirm_booking`, { phone, date: bubbleDate, time });
+  const payload = { phone, date: bubbleDate, time };
+  if (name) payload.name = name;
+  await axios.post(`${BUBBLE}/confirm_booking`, payload);
 }
 
 /******************************************************************
@@ -258,6 +263,7 @@ async function runAgent(session, userText) {
             const hours = await getAvailableHours(date);
             session.hours = hours;
             session.hoursSent = false;
+            session.justFetchedHours = true;
             result = { ok: true, date, hours };
           }
         } else if (name === "confirm_booking") {
@@ -388,10 +394,13 @@ app.post("/webhook", async (req, res) => {
       user: null,
       date: null,
       hours: null,
-      hoursSent: false
+      hoursSent: false,
+      pendingTime: null,
+      justFetchedHours: false
     };
   }
   session.phone = phone;
+  session.justFetchedHours = false;
 
   // Reset manual para pruebas
   if (normalizedText === "reset") {
@@ -409,14 +418,20 @@ app.post("/webhook", async (req, res) => {
   // Si ya tenemos horarios y el usuario manda una hora, confirmar directo
   const timeCandidate = extractTime(text);
   if (timeCandidate && session.hours?.includes(timeCandidate)) {
-    await confirmBooking(phone, session.date, timeCandidate);
+    if (!session.user?.name) {
+      session.pendingTime = timeCandidate;
+      await safeSendText(phone, "¿A nombre de quién hago la reserva?");
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
+    await confirmBooking(phone, session.date, timeCandidate, session.user?.name);
     await safeSendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
     await clearSession(phone);
     return res.sendStatus(200);
   }
 
   // Si es un saludo inicial, no repetir saludo ni romper el flujo
-  if (isNewSession && isGreeting(text)) {
+  if (isNewSession && isGreeting(text) && !hasBookingIntent(text)) {
     if (!session.user) {
       session.user = await findUser(phone);
     }
@@ -429,9 +444,25 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
+  // Si estamos esperando nombre, usar el siguiente mensaje como nombre
+  if (session.pendingTime) {
+    session.user = session.user || { found: false };
+    session.user.name = text.trim();
+    await confirmBooking(phone, session.date, session.pendingTime, session.user?.name);
+    await safeSendText(phone, "¡Listo! Tu reserva quedó confirmada 🙌");
+    await clearSession(phone);
+    return res.sendStatus(200);
+  }
+
   const { finalText, messages } = await runAgent(session, text);
 
-  await safeSendText(phone, finalText);
+  const shouldSendText =
+    !session.justFetchedHours &&
+    !(session.hours?.length && !session.hoursSent);
+
+  if (shouldSendText) {
+    await safeSendText(phone, finalText);
+  }
 
   session.messages = messages
     .filter(m => m.role === "user" || m.role === "assistant")
