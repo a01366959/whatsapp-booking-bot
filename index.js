@@ -39,12 +39,31 @@ const MAX_BUTTONS = 3;
 const MEXICO_TZ = "America/Mexico_City";
 const CONFIRM_ENDPOINT = process.env.BUBBLE_CONFIRM_ENDPOINT || "confirm_reserva";
 
-const bubbleClient = axios.create({
-  baseURL: BUBBLE,
-  headers: {
-    Authorization: `Bearer ${process.env.BUBBLE_TOKEN}`
+const BUBBLE_HEADERS = {
+  Authorization: `Bearer ${process.env.BUBBLE_TOKEN}`
+};
+const BUBBLE_REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+const buildBubbleUrl = path => `${BUBBLE}${path.startsWith("/") ? "" : "/"}${path}`;
+
+async function bubbleRequest(method, path, { params, data } = {}) {
+  const url = buildBubbleUrl(path);
+  const config = {
+    method,
+    url,
+    params,
+    data,
+    headers: BUBBLE_HEADERS,
+    maxRedirects: 0,
+    validateStatus: status => (status >= 200 && status < 400) || BUBBLE_REDIRECTS.has(status)
+  };
+  let res = await axios.request(config);
+  if (BUBBLE_REDIRECTS.has(res.status) && res.headers?.location) {
+    const redirectedUrl = new URL(res.headers.location, url).toString();
+    res = await axios.request({ ...config, url: redirectedUrl });
   }
-});
+  return res;
+}
 
 /******************************************************************
  * SYSTEM PROMPT (AGENTE)
@@ -212,7 +231,7 @@ const ensureFlowToken = async phone => {
  * BUBBLE
  ******************************************************************/
 async function findUser(phone) {
-  const r = await bubbleClient.get(`/get_user`, { params: { phone } });
+  const r = await bubbleRequest("get", "/get_user", { params: { phone } });
   return r.data?.response || { found: false };
 }
 
@@ -220,7 +239,7 @@ async function getAvailableHours(date, desiredSport) {
   const bubbleDate = toBubbleDate(date);
   const { hour } = getMexicoDateParts();
   const currentTimeNumber = hour;
-  const r = await bubbleClient.get(`/get_hours`, {
+  const r = await bubbleRequest("get", "/get_hours", {
     params: {
       sport: desiredSport || DEFAULT_SPORT,
       date: bubbleDate,
@@ -237,17 +256,17 @@ async function confirmBooking(phone, date, time, name, userId, sport) {
   if (name) basePayload.name = name;
   const withUser = userId ? { ...basePayload, user: userId } : basePayload;
   try {
-    await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, withUser);
+    await bubbleRequest("post", `/${CONFIRM_ENDPOINT}`, { data: withUser });
   } catch (err) {
     console.error("confirmBooking failed", {
-      baseURL: bubbleClient.defaults.baseURL,
+      baseURL: BUBBLE,
       url: err?.config?.url,
       method: err?.config?.method,
       statusCode: err?.response?.status,
       data: err?.response?.data
     });
     if (userId) {
-      await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, basePayload);
+      await bubbleRequest("post", `/${CONFIRM_ENDPOINT}`, { data: basePayload });
       return;
     }
     throw err;
