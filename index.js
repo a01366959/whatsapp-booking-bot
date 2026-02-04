@@ -24,13 +24,16 @@ const redis = new Redis({
  * CONSTANTS
  ******************************************************************/
 const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
-const RAW_BUBBLE_BASE = process.env.BUBBLE_BASE_URL || "";
-const BUBBLE_BASE_URL = RAW_BUBBLE_BASE.startsWith("http://")
-  ? RAW_BUBBLE_BASE.replace(/^http:\/\//, "https://")
-  : RAW_BUBBLE_BASE.startsWith("https://")
-    ? RAW_BUBBLE_BASE
-    : `https://${RAW_BUBBLE_BASE}`;
-const BUBBLE = `${BUBBLE_BASE_URL}/api/1.1/wf`;
+const RAW_BUBBLE_BASE = (process.env.BUBBLE_BASE_URL || "").trim();
+const normalizeBubbleBase = raw => {
+  if (!raw) return "";
+  let base = raw.replace(/\/$/, "");
+  if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
+  base = base.replace(/^http:\/\//i, "https://");
+  base = base.replace(/\/api\/1\.1\/wf$/i, "");
+  return `${base}/api/1.1/wf`;
+};
+const BUBBLE = normalizeBubbleBase(RAW_BUBBLE_BASE);
 const DEFAULT_SPORT = "Padel";
 const MAX_BUTTONS = 3;
 const MEXICO_TZ = "America/Mexico_City";
@@ -236,6 +239,13 @@ async function confirmBooking(phone, date, time, name, userId, sport) {
   try {
     await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, withUser);
   } catch (err) {
+    console.error("confirmBooking failed", {
+      baseURL: bubbleClient.defaults.baseURL,
+      url: err?.config?.url,
+      method: err?.config?.method,
+      statusCode: err?.response?.status,
+      data: err?.response?.data
+    });
     if (userId) {
       await bubbleClient.post(`/${CONFIRM_ENDPOINT}`, basePayload);
       return;
