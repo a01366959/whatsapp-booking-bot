@@ -257,7 +257,7 @@ async function runAgent(session, userText) {
         } else if (name === "send_buttons") {
           const buttons = (args.buttons || []).slice(0, 5);
           if (buttons.length) {
-            await sendButtons(
+            await safeSendButtons(
               session.phone,
               args.text || "Selecciona una opción:",
               buttons.map(h => ({ type: "reply", reply: { id: h, title: h } }))
@@ -316,6 +316,28 @@ const sendButtons = (to, text, buttons) =>
     { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
   );
 
+async function safeSendText(to, text) {
+  if (!to) return { ok: false, error: "missing_to" };
+  try {
+    await sendText(to, text);
+    return { ok: true };
+  } catch (err) {
+    console.error("sendText failed", err?.response?.data || err?.message || err);
+    return { ok: false, error: "sendText_failed" };
+  }
+}
+
+async function safeSendButtons(to, text, buttons) {
+  if (!to) return { ok: false, error: "missing_to" };
+  try {
+    await sendButtons(to, text, buttons);
+    return { ok: true };
+  } catch (err) {
+    console.error("sendButtons failed", err?.response?.data || err?.message || err);
+    return { ok: false, error: "sendButtons_failed" };
+  }
+}
+
 /******************************************************************
  * WEBHOOK
  ******************************************************************/
@@ -349,6 +371,7 @@ app.post("/webhook", async (req, res) => {
       hours: null
     };
   }
+  session.phone = phone;
 
   // Fecha directa (sin IA)
   if (!session.date) {
@@ -365,7 +388,7 @@ app.post("/webhook", async (req, res) => {
 
   const { finalText, messages } = await runAgent(session, text);
 
-  await sendText(phone, finalText);
+  await safeSendText(phone, finalText);
 
   session.messages = messages
     .filter(m => m.role === "user" || m.role === "assistant")
