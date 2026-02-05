@@ -80,7 +80,7 @@ async function bubbleRequest(method, path, { params, data } = {}) {
 const SYSTEM_MESSAGE = {
   role: "system",
   content: `
-Eres Michelle, recepcionista humana de Black Padel & Pickleball (México).
+Eres Michelle, recepcionista humana de Black Padel, Pickleball & Golf (México).
 
 REGLAS DURAS:
 - NO repitas saludos
@@ -91,6 +91,7 @@ REGLAS DURAS:
 - Si ya hay horarios, NO preguntes horas
 - Si necesitas datos, pregunta de forma breve y natural
 - Si el usuario quiere reservar, pide solo lo mínimo (deporte, fecha, hora, duración)
+- Si la pregunta NO es de reserva, responde directo sin pedir deporte/fecha
 
 HERRAMIENTAS:
 - get_user: obtener nombre del cliente por teléfono
@@ -126,6 +127,56 @@ const WEEKDAY_INDEX = {
   sabado: 6
 };
 
+const MONTH_INDEX = {
+  enero: 1,
+  febrero: 2,
+  marzo: 3,
+  abril: 4,
+  mayo: 5,
+  junio: 6,
+  julio: 7,
+  agosto: 8,
+  septiembre: 9,
+  setiembre: 9,
+  octubre: 10,
+  noviembre: 11,
+  diciembre: 12
+};
+
+const SPANISH_NUMBERS = {
+  un: 1,
+  uno: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10
+};
+
+const parseDayMonth = t => {
+  const m = t.match(/\b(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?\b/);
+  if (!m) return null;
+  const day = Number(m[1]);
+  const monthName = m[2];
+  const month = MONTH_INDEX[monthName];
+  if (!month) return null;
+  const year = m[3] ? Number(m[3]) : null;
+  return { day, month, year };
+};
+
+const parseRelativeDays = t => {
+  const m = t.match(/\ben\s+(\d+|[a-z]+)\s+dias?\b/);
+  if (!m) return null;
+  const raw = m[1];
+  const n = Number.isNaN(Number(raw)) ? SPANISH_NUMBERS[raw] : Number(raw);
+  return Number.isFinite(n) ? n : null;
+};
+
 const resolveDate = text => {
   const t = normalizeText(text);
   const { dateStr, weekdayIndex } = getMexicoDateParts();
@@ -136,6 +187,27 @@ const resolveDate = text => {
     const d = new Date(base);
     d.setUTCDate(d.getUTCDate() + 1);
     return d.toISOString().slice(0, 10);
+  }
+
+  const relDays = parseRelativeDays(t);
+  if (relDays) {
+    const d = new Date(base);
+    d.setUTCDate(d.getUTCDate() + relDays);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const dayMonth = parseDayMonth(t);
+  if (dayMonth) {
+    const { day, month, year } = dayMonth;
+    const { dateStr: todayStr } = getMexicoDateParts();
+    const [ty, tm, td] = todayStr.split("-").map(Number);
+    let y = year || ty;
+    const candidate = new Date(Date.UTC(y, month - 1, day));
+    const today = new Date(Date.UTC(ty, tm - 1, td));
+    if (!year && candidate < today) {
+      y += 1;
+    }
+    return new Date(Date.UTC(y, month - 1, day)).toISOString().slice(0, 10);
   }
 
   for (const [day, idx] of Object.entries(WEEKDAY_INDEX)) {
@@ -181,6 +253,10 @@ const getMexicoDateParts = () => {
 };
 
 const extractTime = text => {
+  const t = normalizeText(text);
+  if (/\bde\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/.test(t)) {
+    return null;
+  }
   const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (m) {
     const hh = m[1].padStart(2, "0");
@@ -200,7 +276,7 @@ const isGreeting = text =>
   /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text);
 
 const hasBookingIntent = text =>
-  /\b(reservar|reserva|resev|agendar|agenda|apart(ar)?|cancha|horario)\b/i.test(text);
+  /\b(reservar|reserva|resev|resevar|reserbar|agendar|agenda|apart(ar)?|cancha|horario|jugar|juego|jugará)\b/i.test(text);
 
 const isYes = text =>
   /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text);
@@ -209,6 +285,19 @@ const wantsOtherTimes = text =>
   /\b(otra\s+hora|otras\s+horas|que\s+otra|qué\s+otra|opciones|alternativas|diferente|más\s+tarde|mas\s+tarde|más\s+temprano|mas\s+temprano)\b/i.test(
     text
   );
+const wantsAvailability = text =>
+  /\b(horarios|disponibilidad|disponible|espacios|que\s+horarios)\b/i.test(text);
+
+const isInfoQuestion = text =>
+  /\b(que\s+pasa|qué\s+pasa|llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|politica|política|regla|cancel|reagend|reembolso|devolucion|precio|costo|tarifa|ubicacion|ubicación|direccion|dirección|estacionamiento|clases|torneos|renta|rentar)\b/i.test(
+    text
+  );
+
+const isNameQuestion = text =>
+  /\b(como\s+te\s+llamas|cual\s+es\s+tu\s+nombre|quien\s+eres)\b/i.test(text);
+
+const isLateQuestion = text =>
+  /\b(llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|voy\s+a\s+llegar\s+tarde)\b/i.test(text);
 
 const formatDateEs = dateStr => {
   if (!dateStr) return "";
@@ -452,9 +541,11 @@ async function runAgent(session, userText) {
 - user_found: ${session.user?.found ? "si" : "no"}
 - user_name: ${session.user?.name || "desconocido"}
 - user_id: ${session.user?.id || "desconocido"}
+- user_last_name: ${session.userLastName || "desconocido"}
 - date: ${session.date || "null"}
 - hours: ${session.hours?.length ? session.hours.join(", ") : "null"}
-- sport: ${session.sport || DEFAULT_SPORT}`
+- sport: ${session.sport || DEFAULT_SPORT}
+- duration: ${session.duration || 1}`
     },
     ...session.messages.filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
   ];
@@ -615,6 +706,7 @@ app.post("/webhook", async (req, res) => {
     msg.interactive?.button_reply?.id ||
     "";
   const normalizedText = text.trim().toLowerCase();
+  const cleanText = normalizeText(text);
   const msgTs = Number(msg.timestamp || 0);
 
   const flowToken = await ensureFlowToken(phone);
@@ -639,6 +731,11 @@ app.post("/webhook", async (req, res) => {
       desiredTime: null,
       sport: null,
       duration: 1,
+      awaitingSport: false,
+      awaitingDate: false,
+      awaitingTime: false,
+      awaitingDuration: false,
+      noAvailabilityDate: null,
       lastTs: 0
     };
   }
@@ -660,14 +757,39 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Fecha / deporte / duración directos (sin IA)
+  const prevDate = session.date;
+  const prevSport = session.sport;
   const parsedDate = resolveDate(text);
-  if (parsedDate) session.date = parsedDate;
+  if (parsedDate) {
+    session.date = parsedDate;
+    session.awaitingDate = false;
+    session.noAvailabilityDate = null;
+    if (prevDate && parsedDate !== prevDate) {
+      session.slots = [];
+      session.options = [];
+      session.hours = null;
+    }
+  }
   const parsedSport = extractSport(text);
-  if (parsedSport) session.sport = parsedSport;
+  if (parsedSport) {
+    session.sport = parsedSport;
+    session.awaitingSport = false;
+    if (prevSport && parsedSport !== prevSport) {
+      session.slots = [];
+      session.options = [];
+      session.hours = null;
+    }
+  }
   const parsedDuration = extractDuration(text);
-  if (parsedDuration) session.duration = parsedDuration;
+  if (parsedDuration) {
+    session.duration = parsedDuration;
+    session.awaitingDuration = false;
+  }
   const earlyTimeCandidate = extractTime(text);
-  if (earlyTimeCandidate) session.desiredTime = earlyTimeCandidate;
+  if (earlyTimeCandidate) {
+    session.desiredTime = earlyTimeCandidate;
+    session.awaitingTime = false;
+  }
   if (session.duration > 3) {
     session.duration = 3;
     await safeSendText(phone, "El máximo es 3 horas. ¿Te parece 3 horas?", flowToken);
@@ -679,26 +801,75 @@ app.post("/webhook", async (req, res) => {
     session.hours = startTimesFromOptions(session.options);
   }
 
-  if (!session.user && (hasBookingIntent(text) || session.date || session.pendingTime || session.pendingConfirm)) {
+  if (!session.user && (hasBookingIntent(cleanText) || session.date || session.pendingTime || session.pendingConfirm)) {
     session.user = await findUser(phone);
     if (session.user?.last_name) session.userLastName = session.user.last_name;
   }
 
-  const bookingIntent = hasBookingIntent(text) || session.date || session.sport || session.pendingTime || session.pendingConfirm;
+  if (isNameQuestion(cleanText)) {
+    await safeSendText(phone, "Soy Michelle, recepcionista del club. ¿En qué te ayudo?", flowToken);
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
+
+  if (isLateQuestion(cleanText)) {
+    await safeSendText(
+      phone,
+      "Gracias por avisar. Si vas a llegar tarde, avísanos por aquí y te apoyamos según disponibilidad.",
+      flowToken
+    );
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
+
+  const infoQuestion = isInfoQuestion(cleanText);
+  const bookingIntent =
+    !infoQuestion &&
+    (hasBookingIntent(cleanText) ||
+      session.date ||
+      session.sport ||
+      session.pendingTime ||
+      session.pendingConfirm ||
+      session.awaitingSport ||
+      session.awaitingDate ||
+      session.awaitingTime);
+
+  if (infoQuestion && !bookingIntent) {
+    const { finalText, messages } = await runAgent(session, text);
+    await safeSendText(phone, finalText, flowToken);
+    session.messages = messages
+      .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
+      .slice(-12);
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
+
   if (bookingIntent && !session.sport) {
+    session.awaitingSport = true;
     await safeSendText(phone, "¿Para qué deporte quieres reservar? (Padel, Pickleball o Golf)", flowToken);
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
   if (bookingIntent && !session.date) {
+    session.awaitingDate = true;
     await safeSendText(phone, "¿Para qué fecha te gustaría reservar?", flowToken);
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
+  if (session.noAvailabilityDate && wantsAvailability(cleanText)) {
+    await safeSendText(
+      phone,
+      `Para ${formatDateEs(session.noAvailabilityDate)} no tengo disponibilidad. ¿Quieres que revise mañana u otra fecha?`,
+      flowToken
+    );
+    await saveSession(phone, session);
+    return res.sendStatus(200);
+  }
+
   // Si el usuario pide otras horas y ya tenemos opciones, responder con opciones
-  if (session.options?.length && wantsOtherTimes(normalizedText)) {
+  if (session.options?.length && wantsOtherTimes(cleanText)) {
     const suggestions = pickClosestOptions(session.options, session.desiredTime);
     const buttons = suggestions.map(o => ({
       type: "reply",
@@ -708,6 +879,7 @@ app.post("/webhook", async (req, res) => {
       ? `Te puedo ofrecer: ${suggestions.map(o => o.start).join(", ")}.`
       : "No tengo más opciones disponibles.";
     await safeSendButtons(phone, msgText, buttons, flowToken);
+    session.awaitingTime = true;
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
@@ -812,7 +984,7 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Si es un saludo inicial, no repetir saludo ni romper el flujo
-  if (isNewSession && isGreeting(text) && !hasBookingIntent(text)) {
+  if (isNewSession && isGreeting(text) && !hasBookingIntent(cleanText)) {
     if (!session.user) {
       session.user = await findUser(phone);
     }
@@ -867,7 +1039,13 @@ app.post("/webhook", async (req, res) => {
       session.options = buildOptions(slots, session.duration || 1);
       session.hours = startTimesFromOptions(session.options);
       if (!session.options.length) {
-        await safeSendText(phone, "No tengo horarios disponibles para esa fecha.", flowToken);
+        session.noAvailabilityDate = session.date;
+        session.awaitingDate = true;
+        await safeSendText(
+          phone,
+          `Para ${formatDateEs(session.date)} no tengo horarios disponibles. ¿Quieres que revise mañana u otra fecha?`,
+          flowToken
+        );
         await saveSession(phone, session);
         return res.sendStatus(200);
       }
@@ -882,6 +1060,7 @@ app.post("/webhook", async (req, res) => {
             .join(", ")}.`
         : "¿A qué hora te gustaría reservar?";
       await safeSendButtons(phone, msg, buttons, flowToken);
+      session.awaitingTime = true;
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
