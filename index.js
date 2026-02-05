@@ -697,6 +697,8 @@ Reglas:
 - Si el usuario pregunta algo general (no reserva), responde con action=reply.
 - Si falta info para reservar, usa action=ask.
 - Si ya hay datos suficientes, usa get_hours o confirm_reserva.
+- No vuelvas a pedir datos que ya están en contexto.
+- Si el usuario ya dio deporte/fecha/hora en el mensaje, úsalo en params.
 - Usa fecha relativa en MX; hoy es ${dateStr}.
 `;
   const context = {
@@ -873,6 +875,15 @@ app.post("/webhook", async (req, res) => {
     }
     if (params.last_name) session.userLastName = params.last_name;
 
+    const missingSport = !session.sport;
+    const missingDate = !session.date;
+    const missingTime = !session.desiredTime;
+
+    // Si el LLM pide datos que ya tenemos, corrige la acción
+    if (decision.action === "ask" && !missingSport && !missingDate) {
+      decision.action = "get_hours";
+    }
+
     if (decision.action === "get_user") {
       session.user = await findUser(phone);
       if (session.user?.last_name) session.userLastName = session.user.last_name;
@@ -880,7 +891,8 @@ app.post("/webhook", async (req, res) => {
 
     if (decision.action === "get_hours") {
       if (!session.sport || !session.date) {
-        await safeSendText(phone, decision.message || "¿Para qué deporte y fecha?", flowToken);
+        const ask = decision.message || "¿Para qué deporte y fecha?";
+        await safeSendText(phone, ask, flowToken);
         await saveSession(phone, session);
         return res.sendStatus(200);
       }
@@ -953,7 +965,18 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (decision.action === "ask") {
-      await safeSendText(phone, decision.message || "¿Me ayudas con un dato más?", flowToken);
+      const ask =
+        decision.message ||
+        (missingSport && missingDate
+          ? "¿Para qué deporte y fecha?"
+          : missingSport
+            ? "¿Para qué deporte quieres reservar?"
+            : missingDate
+              ? "¿Para qué fecha te gustaría reservar?"
+              : missingTime
+                ? "¿A qué hora te gustaría reservar?"
+                : "¿Me ayudas con un dato más?");
+      await safeSendText(phone, ask, flowToken);
       await saveSession(phone, session);
       return res.sendStatus(200);
     }
