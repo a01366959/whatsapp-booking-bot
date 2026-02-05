@@ -531,6 +531,57 @@ const TOOLS = [
   },
 ];
 
+async function interpretMessage(session, userText) {
+  const { dateStr } = getMexicoDateParts();
+  const sys = `
+Eres Michelle, recepcionista humana de Black Padel, Pickleball & Golf (México).
+Tu tarea es interpretar el mensaje del usuario y extraer intención y datos.
+Reglas:
+- Devuelve SOLO JSON válido.
+- "intent": "book" si el usuario quiere reservar o preguntar horarios; "info" si es una duda general; "other" si es otra cosa.
+- Si el usuario menciona fecha relativa ("hoy", "mañana", "este viernes", "en dos días"), convierte a YYYY-MM-DD usando México (America/Mexico_City).
+- Si el usuario menciona hora, usa HH:MM.
+- Si el usuario menciona duración, usa 1-3.
+Hoy en México es ${dateStr}.
+`;
+
+  const context = {
+    known_sport: session.sport || null,
+    known_date: session.date || null,
+    known_time: session.desiredTime || null,
+    known_duration: session.duration || null
+  };
+
+  const messages = [
+    { role: "system", content: sys },
+    { role: "system", content: `Contexto: ${JSON.stringify(context)}` },
+    { role: "user", content: userText }
+  ];
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages,
+      temperature: 0.2,
+      response_format: { type: "json_object" }
+    });
+    const content = resp.choices[0]?.message?.content || "{}";
+    const data = JSON.parse(content);
+    return {
+      intent: data.intent || "other",
+      reply: data.reply || "",
+      sport: data.sport || null,
+      date: data.date || null,
+      time: data.time || null,
+      duration: data.duration_hours || data.duration || null,
+      name: data.name || null,
+      last_name: data.last_name || null
+    };
+  } catch {
+    return { intent: "other" };
+  }
+}
+
 async function runAgent(session, userText) {
   const context = [
     SYSTEM_MESSAGE,
@@ -756,10 +807,13 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
+  const interpretation =
+    !session.pendingConfirm && !session.pendingTime ? await interpretMessage(session, text) : null;
+
   // Fecha / deporte / duración directos (sin IA)
   const prevDate = session.date;
   const prevSport = session.sport;
-  const parsedDate = resolveDate(text);
+  const parsedDate = interpretation?.date || resolveDate(text);
   if (parsedDate) {
     session.date = parsedDate;
     session.awaitingDate = false;
@@ -770,7 +824,7 @@ app.post("/webhook", async (req, res) => {
       session.hours = null;
     }
   }
-  const parsedSport = extractSport(text);
+  const parsedSport = interpretation?.sport || extractSport(text);
   if (parsedSport) {
     session.sport = parsedSport;
     session.awaitingSport = false;
@@ -780,15 +834,22 @@ app.post("/webhook", async (req, res) => {
       session.hours = null;
     }
   }
-  const parsedDuration = extractDuration(text);
+  const parsedDuration = interpretation?.duration || extractDuration(text);
   if (parsedDuration) {
     session.duration = parsedDuration;
     session.awaitingDuration = false;
   }
-  const earlyTimeCandidate = extractTime(text);
+  const earlyTimeCandidate = interpretation?.time || extractTime(text);
   if (earlyTimeCandidate) {
     session.desiredTime = earlyTimeCandidate;
     session.awaitingTime = false;
+  }
+  if (interpretation?.name) {
+    session.user = session.user || { found: false };
+    session.user.name = interpretation.name;
+  }
+  if (interpretation?.last_name) {
+    session.userLastName = interpretation.last_name;
   }
   if (session.duration > 3) {
     session.duration = 3;
@@ -806,13 +867,13 @@ app.post("/webhook", async (req, res) => {
     if (session.user?.last_name) session.userLastName = session.user.last_name;
   }
 
-  if (isNameQuestion(cleanText)) {
+  if (!interpretation && isNameQuestion(cleanText)) {
     await safeSendText(phone, "Soy Michelle, recepcionista del club. ¿En qué te ayudo?", flowToken);
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
-  if (isLateQuestion(cleanText)) {
+  if (!interpretation && isLateQuestion(cleanText)) {
     await safeSendText(
       phone,
       "Gracias por avisar. Si vas a llegar tarde, avísanos por aquí y te apoyamos según disponibilidad.",
@@ -824,17 +885,25 @@ app.post("/webhook", async (req, res) => {
 
   const infoQuestion = isInfoQuestion(cleanText);
   const bookingIntent =
-    !infoQuestion &&
-    (hasBookingIntent(cleanText) ||
-      session.date ||
-      session.sport ||
-      session.pendingTime ||
-      session.pendingConfirm ||
-      session.awaitingSport ||
-      session.awaitingDate ||
-      session.awaitingTime);
+    interpretation?.intent === "book" ||
+    (!infoQuestion &&
+      (hasBookingIntent(cleanText) ||
+        session.date ||
+        session.sport ||
+        session.pendingTime ||
+        session.pendingConfirm ||
+        session.awaitingSport ||
+        session.awaitingDate ||
+        session.awaitingTime));
 
-  if (infoQuestion && !bookingIntent) {
+  const infoIntent = interpretation?.intent === "info" || infoQuestion;
+  if (infoIntent && !bookingIntent) {
+    const reply = interpretation?.reply;
+    if (reply) {
+      await safeSendText(phone, reply, flowToken);
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
     const { finalText, messages } = await runAgent(session, text);
     await safeSendText(phone, finalText, flowToken);
     session.messages = messages
@@ -846,14 +915,16 @@ app.post("/webhook", async (req, res) => {
 
   if (bookingIntent && !session.sport) {
     session.awaitingSport = true;
-    await safeSendText(phone, "¿Para qué deporte quieres reservar? (Padel, Pickleball o Golf)", flowToken);
+    const ask = interpretation?.reply || "¿Para qué deporte quieres reservar? (Padel, Pickleball o Golf)";
+    await safeSendText(phone, ask, flowToken);
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
 
   if (bookingIntent && !session.date) {
     session.awaitingDate = true;
-    await safeSendText(phone, "¿Para qué fecha te gustaría reservar?", flowToken);
+    const ask = interpretation?.reply || "¿Para qué fecha te gustaría reservar?";
+    await safeSendText(phone, ask, flowToken);
     await saveSession(phone, session);
     return res.sendStatus(200);
   }
