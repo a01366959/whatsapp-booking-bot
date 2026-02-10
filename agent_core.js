@@ -422,7 +422,14 @@ const uniqueStarts = options => {
   return Array.from(map.values());
 };
 
-const startTimesFromOptions = options => uniqueStarts(options).map(o => o.start);
+const startTimesFromOptions = options => {
+  const times = uniqueStarts(options).map(o => o.start);
+  return times.sort((a, b) => {
+    const hourA = parseInt(a.split(':')[0]);
+    const hourB = parseInt(b.split(':')[0]);
+    return hourA - hourB;
+  });
+};
 
 const pickClosestOptions = (options, desiredTime) => {
   const unique = uniqueStarts(options);
@@ -637,17 +644,18 @@ async function safeSendList(to, bodyText, buttonText, sections, flowToken) {
   }
   try {
     if (!senders?.list) {
-      logger?.warn?.("list sender not configured, falling back to text");
+      logger?.warn?.(`[LIST] sender not configured, falling back to text. Sections: ${sections.length}`);
       const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
       await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
       return { ok: true };
     }
+    logger?.info?.(`[LIST] Sending list with ${sections[0]?.rows?.length || 0} options to ${to}`);
     await senders.list(to, bodyText, buttonText, sections);
     await logEvent("send_list", { to, bodyText, sectionsCount: sections.length });
     return { ok: true };
   } catch (err) {
-    logger?.error?.("sendList failed", err?.response?.data || err?.message || err);
-    logger?.warn?.("falling back to text message for list");
+    logger?.error?.(`[LIST] sendList failed: ${err?.message}`, err?.response?.data || err);
+    logger?.warn?.(`[LIST] falling back to text message`);
     const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
     await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
     return { ok: true };
@@ -882,6 +890,8 @@ EJEMPLOS DE EXTRACCIÓN:
 - "14:00" o "14:30" → time: "14:00" o "14:30"
 - "A las 2:00pm" → time: "14:00"
 - "A las 3 de la tarde" → time: "15:00"
+- "11 por favor" o "dame el 9" → time: "11:00" o "09:00"
+- Usuario SOLO dice número (1-23) en contexto de horarios → time: "XX:00"
 - "Mañana" con sport/fecha anterior → date: YYYY-MM-DD (siguiente día)
 - "Padel mañana" → sport: "Padel", date: mañana
 - "Mi nombre es Juan Pérez" → name: "Juan", last_name: "Pérez"
@@ -901,14 +911,14 @@ REGLAS PARA RESPONDER:
 3. NUNCA digas "Claro, aquí están..." o "Aquí tienes..." sin mostrar contenido - usa get_hours para mostrar
 4. Si el usuario pregunta UBICACIÓN/DIRECCIÓN/COMO LLEGAR → action=send_location (pin de Google Maps)
 5. Si pregunta "¿Qué horarios tienes?" + DEPORTE + FECHA → action=get_hours (SIEMPRE get_hours, NO reply)
-6. Si pregunta "Tienes más horas?" o "Dame más opciones" → action=reply + message="[MOSTRAR_MAS]"
-7. Si dice "más tarde" o "más temprano" en contexto de horarios → extrae eso como preferencia en params.time
-8. DEPORTE + FECHA (sin hora específica) → action=get_hours (muestra lista solo si NO tiene hora en mente)
+6. Si pregunta "Tienes más horas?" o "horarios más tarde" → action=get_hours (re-carga y filtra)
+7. DEPORTE + FECHA (sin hora específica) → action=get_hours (muestra lista)
   Ej: "Padel mañana" || "Quiero Pickleball el 11"
-7. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directo)
-  Ej: "Padel el 11 a las 3" || "Quiero jugar mañana a las 15:00"
-  Ej: Si user dice "15:00" después que mostraste horarios → action=confirm_reserva
-6. Si pregunta solo info (ubicación, horarios del club, instalaciones) → action=reply (breve)
+8. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directo)
+  Ej: "Padel el 11 a las 3" || "11 por favor" || "dame el 9"
+  Ej: Si user dice "15:00" o número solo (en contexto) → action=confirm_reserva
+9. Si pregunta solo info (instalaciones, reglas) → action=reply (breve)
+10. Si quiere reservar pero faltan datos → action=ask
 7. Si quiere reservar pero faltan datos → action=ask
 8. El nombre se guarda en params.name cuando lo menciona directamente
 9. NO emojis, NO listas múltiples, respuestas naturales
@@ -1117,6 +1127,7 @@ async function handleWhatsApp(event) {
       }
       if (isYes(normalizedText)) {
         const confirm = session.pendingConfirm;
+        session.pendingConfirm = null;
         try {
         await confirmBooking(
           phone,
@@ -1132,6 +1143,7 @@ async function handleWhatsApp(event) {
         await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
         await clearSession(phone);
       } catch (err) {
+        logger?.error?.(`[BOOKING ERROR] ${err?.message}`);
         const slots = await getAvailableHours(confirm.date, session.sport);
         session.slots = slots;
         session.options = buildOptions(slots, session.duration || 1);
@@ -1139,9 +1151,9 @@ async function handleWhatsApp(event) {
         const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
         if (suggestions.length) {
           const timeList = suggestions.map(o => o.start).join(", ");
-          await safeSendText(phone, `No pude confirmar. Te puedo ofrecer: ${timeList}.`, flowToken);
+          await safeSendText(phone, `Lo siento, ese horario ya se reservó. Te puedo ofrecer: ${timeList}.`, flowToken);
         } else {
-          await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
+          await safeSendText(phone, "Lo siento, ese horario ya no está disponible. ¿Quieres intentar otra fecha?", flowToken);
         }
         await saveSession(phone, session);
       }
@@ -1212,7 +1224,16 @@ async function handleWhatsApp(event) {
     
     if (params.sport) session.sport = params.sport;
     if (params.date) session.date = params.date;
-    if (params.time) session.desiredTime = params.time;
+    if (params.time) {
+      let parsedTime = params.time;
+      if (/^\d{1,2}$/.test(parsedTime)) {
+        const hour = parseInt(parsedTime);
+        if (hour >= 0 && hour <= 23) {
+          parsedTime = `${String(hour).padStart(2, '0')}:00`;
+        }
+      }
+      session.desiredTime = parsedTime;
+    }
     if (params.duration_hours) session.duration = params.duration_hours;
     if (params.name) {
       if (!session.user || !session.user.found) {
