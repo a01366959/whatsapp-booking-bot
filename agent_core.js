@@ -577,8 +577,9 @@ async function findUser(phone) {
 
 async function getAvailableHours(date, desiredSport) {
   const bubbleDate = toBubbleDate(date);
-  const { hour } = getMexicoDateParts();
-  const currentTimeNumber = hour;
+  const { hour, dateStr } = getMexicoDateParts();
+  const dateOnly = (date || "").includes("T") ? String(date).slice(0, 10) : String(date || "");
+  const currentTimeNumber = dateOnly && dateOnly === dateStr ? hour : 0;
   const r = await bubbleRequest("get", "/get_hours", {
     params: {
       sport: desiredSport || config.defaultSport,
@@ -603,7 +604,13 @@ async function confirmBooking(phone, date, times, court, name, lastName, userId,
   if (lastName) basePayload.last_name = lastName;
   const withUser = userId ? { ...basePayload, user: userId } : basePayload;
   try {
-    await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: withUser });
+    const res = await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: withUser });
+    const apiError = res?.data?.response?.error;
+    if (apiError) {
+      const err = new Error(apiError);
+      err.code = "slot_taken";
+      throw err;
+    }
   } catch (err) {
     logger?.error?.("confirmBooking failed", {
       baseURL: config.bubbleBaseUrl,
@@ -612,7 +619,7 @@ async function confirmBooking(phone, date, times, court, name, lastName, userId,
       statusCode: err?.response?.status,
       data: err?.response?.data
     });
-    if (userId) {
+    if (userId && err?.code !== "slot_taken") {
       await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: basePayload });
       return;
     }
@@ -875,6 +882,7 @@ async function handleWhatsApp(event) {
       hoursSent: false,
       pendingTime: null,
       pendingConfirm: null,
+      pendingConfirmDraft: null,
       justFetchedHours: false,
       desiredTime: null,
       sport: null,
@@ -883,7 +891,9 @@ async function handleWhatsApp(event) {
       awaitingDate: false,
       awaitingTime: false,
       awaitingDuration: false,
+      awaitingName: false,
       noAvailabilityDate: null,
+      userChecked: false,
       lastTs: 0
     };
   }
@@ -904,6 +914,61 @@ async function handleWhatsApp(event) {
   }
 
   if (config.useAgent) {
+    if (session.awaitingName && session.pendingConfirmDraft) {
+      const fullName = text.trim().split(/\s+/).filter(Boolean);
+      if (fullName.length) {
+        session.user = session.user || { found: false };
+        session.user.name = fullName.shift();
+        session.userLastName = fullName.join(" ");
+      }
+
+      const draft = session.pendingConfirmDraft;
+      session.awaitingName = false;
+      session.pendingConfirmDraft = null;
+
+      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…", flowToken);
+      try {
+        await confirmBooking(
+          phone,
+          draft.date,
+          draft.times,
+          draft.court,
+          session.user?.name || "Cliente",
+          session.userLastName || "",
+          session.user?.id,
+          draft.sport,
+          session.user?.found ? "usuario" : "invitado"
+        );
+        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
+        await clearSession(phone);
+      } catch (err) {
+        const slots = await getAvailableHours(draft.date, draft.sport);
+        session.slots = slots;
+        session.options = buildOptions(slots, session.duration || 1);
+        session.hours = startTimesFromOptions(session.options);
+        const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
+        if (suggestions.length) {
+          const buttons = suggestions.map(o => ({
+            type: "reply",
+            reply: { id: o.start, title: o.start }
+          }));
+          await safeSendButtons(phone, "No pude confirmar. Te puedo ofrecer:", buttons, flowToken);
+        } else {
+          await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
+        }
+        await saveSession(phone, session);
+      }
+      return { actions: [] };
+    }
+
+    if (!session.userChecked) {
+      if (!session.user || session.user.found) {
+        session.user = await findUser(phone);
+        if (session.user?.last_name) session.userLastName = session.user.last_name;
+      }
+      session.userChecked = true;
+    }
+
     const decision = await agentDecide(session, text);
     logger?.info?.(`[AGENT DECISION] action=${decision.action}, params=${JSON.stringify(decision.params || {})}`);
     const params = decision.params || {};
@@ -992,8 +1057,20 @@ async function handleWhatsApp(event) {
         await saveSession(phone, session);
         return { actions: [] };
       }
-      const name = params.name || session.user?.name || "Cliente";
+      const name = params.name || session.user?.name || "";
       const lastName = params.last_name || session.userLastName || "";
+      if (!name && !session.user?.found) {
+        session.awaitingName = true;
+        session.pendingConfirmDraft = {
+          date: session.date,
+          times: match.times,
+          court: match.court,
+          sport: session.sport
+        };
+        await safeSendText(phone, "¿A nombre de quién hago la reserva? (Nombre y apellido)", flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
       await safeSendText(phone, decision.message || "Perfecto, estoy confirmando tu reserva…", flowToken);
       try {
         await confirmBooking(
@@ -1001,7 +1078,7 @@ async function handleWhatsApp(event) {
           session.date,
           match.times,
           match.court,
-          name,
+          name || "Cliente",
           lastName,
           session.user?.id,
           session.sport,
