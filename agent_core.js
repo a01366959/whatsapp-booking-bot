@@ -181,6 +181,8 @@ REGLAS DURAS:
 - Si necesitas datos, pregunta de forma breve y natural
 - Si el usuario quiere reservar, pide solo lo mínimo (deporte, fecha, hora, duración)
 - Si la pregunta NO es de reserva, responde directo sin pedir deporte/fecha
+- Si el usuario te dice su nombre, recuérdalo y úsalo en conversaciones futuras
+- Si el usuario pregunta "como me llamo", usa el nombre que te dio previamente
 
 HERRAMIENTAS:
 - get_user: obtener nombre del cliente por teléfono
@@ -685,7 +687,9 @@ async function runAgent(session, userText) {
 - date: ${session.date || "null"}
 - hours: ${session.hours?.length ? session.hours.join(", ") : "null"}
 - sport: ${session.sport || config.defaultSport}
-- duration: ${session.duration || 1}`
+- duration: ${session.duration || 1}
+
+IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "desconocido", responde con ese nombre.`
     },
     ...session.messages.filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
   ];
@@ -784,14 +788,17 @@ Devuelve SOLO JSON válido con este esquema:
 }
 Reglas:
 - Si el usuario pregunta algo general (no reserva), responde con action=reply.
-- Si falta info para reservar, usa action=ask.
-- Si ya hay datos suficientes, usa get_hours o confirm_reserva.
+- Si el usuario dice su nombre, guárdalo en params.name y responde confirmando.
+- Si el usuario pregunta "como me llamo" o "cual es mi nombre", usa el nombre que tengas en contexto.
+- Para reservas: si falta deporte o fecha, usa action=ask; si tienes ambos, usa action=get_hours.
+- Si ya hay disponibilidad (available_starts tiene elementos) y el usuario elige hora, usa confirm_reserva.
 - No vuelvas a pedir datos que ya están en contexto.
 - Si el usuario ya dio deporte/fecha/hora en el mensaje, úsalo en params.
 - Usa fecha relativa en MX; hoy es ${dateStr}.
 `;
   const context = {
     user: session.user || null,
+    user_name: session.user?.name || null,
     last_name: session.userLastName || null,
     sport: session.sport || null,
     date: session.date || null,
@@ -897,10 +904,14 @@ async function handleWhatsApp(event) {
     if (params.time) session.desiredTime = params.time;
     if (params.duration_hours) session.duration = params.duration_hours;
     if (params.name) {
-      session.user = session.user || { found: false };
-      session.user.name = params.name;
+      if (!session.user || !session.user.found) {
+        session.user = session.user || { found: false };
+        session.user.name = params.name;
+      }
     }
-    if (params.last_name) session.userLastName = params.last_name;
+    if (params.last_name && !session.userLastName) {
+      session.userLastName = params.last_name;
+    }
 
     const interpretation = null;
     const confidence = computeConfidence(decision, interpretation, session);
@@ -938,14 +949,23 @@ async function handleWhatsApp(event) {
       session.slots = slots;
       session.options = buildOptions(slots, session.duration || 1);
       session.hours = startTimesFromOptions(session.options);
+      
+      if (!session.options?.length) {
+        await safeSendText(phone, `No tengo horarios disponibles para ${formatDateEs(session.date)}. ¿Quieres revisar otra fecha?`, flowToken);
+        session.date = null;
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
+      
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
       const buttons = suggestions.map(o => ({
         type: "reply",
         reply: { id: o.start, title: o.start }
       }));
+      const msgText = decision.message || `Estos son los horarios disponibles para ${session.sport} el ${formatDateEs(session.date)}:`;
       await safeSendButtons(
         phone,
-        decision.message || "Estos son los horarios disponibles. Elige uno:",
+        msgText,
         buttons,
         flowToken
       );
@@ -1020,7 +1040,14 @@ async function handleWhatsApp(event) {
     }
 
     if (decision.action === "reply") {
-      await safeSendText(phone, decision.message || "¿Te ayudo con algo más?", flowToken);
+      const replyText = decision.message || "¿Te ayudo con algo más?";
+      await safeSendText(phone, replyText, flowToken);
+      await saveSession(phone, session);
+      return { actions: [] };
+    }
+    
+    // Fallback for noop or unknown actions
+    if (decision.action === "noop") {
       await saveSession(phone, session);
       return { actions: [] };
     }
