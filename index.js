@@ -626,7 +626,7 @@ Hoy en México es ${dateStr}.
 
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
@@ -674,7 +674,7 @@ async function runAgent(session, userText) {
   while (!finalText && guard < 4) {
     guard += 1;
     const response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages,
       tools: TOOLS,
       tool_choice: "auto",
@@ -783,7 +783,7 @@ Reglas:
   ];
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }

@@ -650,7 +650,7 @@ Hoy en México es ${dateStr}.
 
   try {
     const resp = await openai.chat.completions.create({
-      model: deps.config?.interpretModel || "gpt-4.1-mini",
+      model: deps.config?.interpretModel || "gpt-4o-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
@@ -701,7 +701,7 @@ IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "descono
   while (!finalText && guard < 4) {
     guard += 1;
     const response = await openai.chat.completions.create({
-      model: deps.config?.agentModel || "gpt-4.1-mini",
+      model: deps.config?.agentModel || "gpt-4o-mini",
       messages,
       tools: TOOLS,
       tool_choice: "auto",
@@ -775,7 +775,7 @@ async function agentDecide(session, userText) {
 Eres Michelle, recepcionista humana de Black Padel, Pickleball & Golf.
 Devuelve SOLO JSON válido con este esquema:
 {
-  "action": "ask|reply|get_user|get_hours|confirm_reserva|reset_availability|noop",
+  "action": "ask|reply|get_user|get_hours|confirm_reserva",
   "message": "texto para el usuario",
   "params": {
     "sport": "Padel|Pickleball|Golf|null",
@@ -786,15 +786,19 @@ Devuelve SOLO JSON válido con este esquema:
     "last_name": "string|null"
   }
 }
-Reglas:
-- Si el usuario pregunta algo general (no reserva), responde con action=reply.
-- Si el usuario dice su nombre, guárdalo en params.name y responde confirmando.
-- Si el usuario pregunta "como me llamo" o "cual es mi nombre", usa el nombre que tengas en contexto.
-- Para reservas: si falta deporte o fecha, usa action=ask; si tienes ambos, usa action=get_hours.
-- Si ya hay disponibilidad (available_starts tiene elementos) y el usuario elige hora, usa confirm_reserva.
-- No vuelvas a pedir datos que ya están en contexto.
-- Si el usuario ya dio deporte/fecha/hora en el mensaje, úsalo en params.
-- Usa fecha relativa en MX; hoy es ${dateStr}.
+
+REGLAS IMPORTANTES:
+1. Si el usuario SOLO dice un nombre (ej: "Pablo"), guárdalo en params.name y responde "Mucho gusto, Pablo!"
+2. Si el usuario pregunta "como me llamo" y user_name existe, responde "Te llamas [user_name]"
+3. Si el usuario quiere reservar/jugar/agendar:
+   - SIN deporte ni fecha: action=ask, pregunta por deporte y fecha
+   - CON deporte SIN fecha: action=ask, pregunta por fecha
+   - CON deporte Y fecha PERO sin horarios cargados (has_options=false): action=get_hours
+   - CON horarios disponibles (has_options=true) Y el usuario elige hora: action=confirm_reserva
+4. Si es pregunta general del club: action=reply
+5. Extrae siempre sport, date, time del mensaje si los menciona
+6. Fechas relativas: "hoy"=${dateStr}, "mañana"=día siguiente, etc.
+7. NO repitas info que ya está en contexto
 `;
   const context = {
     user: session.user || null,
@@ -814,14 +818,17 @@ Reglas:
   ];
   try {
     const resp = await openai.chat.completions.create({
-      model: deps.config?.decideModel || "gpt-4.1-mini",
+      model: deps.config?.decideModel || "gpt-4o-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
     });
     const content = resp.choices[0]?.message?.content || "{}";
-    return JSON.parse(content);
-  } catch {
+    const parsed = JSON.parse(content);
+    logger?.info?.(`[AGENT_DECIDE] Raw response: ${content}`);
+    return parsed;
+  } catch (err) {
+    logger?.error?.(`[AGENT_DECIDE ERROR] ${err?.message || err}`);
     return { action: "reply", message: "¿Me repites, por favor?", params: {} };
   }
 }
@@ -898,6 +905,7 @@ async function handleWhatsApp(event) {
 
   if (config.useAgent) {
     const decision = await agentDecide(session, text);
+    logger?.info?.(`[AGENT DECISION] action=${decision.action}, params=${JSON.stringify(decision.params || {})}`);
     const params = decision.params || {};
     if (params.sport) session.sport = params.sport;
     if (params.date) session.date = params.date;
@@ -907,11 +915,15 @@ async function handleWhatsApp(event) {
       if (!session.user || !session.user.found) {
         session.user = session.user || { found: false };
         session.user.name = params.name;
+        logger?.info?.(`[NAME STORED] name=${params.name}`);
       }
     }
     if (params.last_name && !session.userLastName) {
       session.userLastName = params.last_name;
+      logger?.info?.(`[LASTNAME STORED] last_name=${params.last_name}`);
     }
+    
+    logger?.info?.(`[SESSION STATE] user.name=${session.user?.name || 'none'}, sport=${session.sport || 'none'}, date=${session.date || 'none'}`);
 
     const interpretation = null;
     const confidence = computeConfidence(decision, interpretation, session);
@@ -1041,16 +1053,15 @@ async function handleWhatsApp(event) {
 
     if (decision.action === "reply") {
       const replyText = decision.message || "¿Te ayudo con algo más?";
+      logger?.info?.(`[REPLY] message=${replyText}`);
       await safeSendText(phone, replyText, flowToken);
       await saveSession(phone, session);
       return { actions: [] };
     }
     
-    // Fallback for noop or unknown actions
-    if (decision.action === "noop") {
-      await saveSession(phone, session);
-      return { actions: [] };
-    }
+    // Fallback for noop or unknown actions - save session and return
+    await saveSession(phone, session);
+    return { actions: [] };
   }
 
   const interpretation =
