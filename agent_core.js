@@ -872,22 +872,18 @@ INFORMACIÓN DEL CLUB:
 
 REGLAS PARA RESPONDER:
 1. Sé amable, cálida y conversacional como una recepcionista real
-2. UBICACIÓN/DIRECCIÓN (palabras clave: "dónde", "ubicación", "ubicados", "dirección", "dirección", "ubicado", "adresse", "dirección"): 
-   → action=send_location (envía pin de Google Maps con coordenadas, después ofrece ayuda)
-3. HORARIOS GENERALES (palabras clave: "cuándo abren", "horarios", "a qué hora", "horario"): 
-   → action=reply con horarios exactos + sugerencia ("¿Quieres ver disponibilidad?")
-4. DEPORTE + FECHA (SIN HORARIOS CARGADOS): Si el usuario proporciona deporte Y fecha (ejemplo: "Padel mañana")
-   O si dice "sí" cuando se le pregunta sobre opciones:
-   → action=get_hours (carga horarios disponibles del API, NO reply, NO ask, NO confirm)
-5. DEPORTE + FECHA + HORARIOS YA CARGADOS (options_available=true) + USUARIO ELIGE HORA: 
-   → action=confirm_reserva
-6. Si el usuario SOLO pregunta por info (sin intención de reservar) → action=reply
-7. Si el usuario quiere reservar pero faltan datos → action=ask
-8. El nombre se guarda cuando el usuario lo menciona directamente (params.name)
-9. Contexto: Revisa campos "sport", "date", "options_available", "desired_time"
-   - Si sport + date pero NO options_available → get_hours
-   - Si sport + date + options_available → ask/confirm_reserva según si tiene time
-10. NO inventes información, NO repitas contexto, NO hagas listas
+2. NUNCA digas "Voy a buscar", "Un momento", "Déjame revisar" - acciona directamente
+3. Si el usuario pregunta UBICACIÓN/DIRECCIÓN → action=send_location (pin de Google Maps)
+4. DEPORTE + FECHA (sin hora) → action=get_hours (muestra lista, NO shows opciones, NO confirm)
+   Ej: "Padel mañana" || "Quiero Pickleball el 11"
+5. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directamente)
+   Ej: "Padel el 11 a las 3" || "Quiero jugar mañana a las 15:00" 
+   Ej: Si user dice "15:00" después que mostraste horarios → action=confirm_reserva
+6. Si pregunta solo info (ubicación, horarios del club, instalaciones) → action=reply (breve)
+7. Si quiere reservar pero faltan datos → action=ask
+8. El nombre se guarda en params.name cuando lo menciona directamente
+9. NO emojis, NO listas múltiples, respuestas naturales
+10. Hoy es ${dateStr}
 11. El mensaje debe ser CONVERSACIONAL y BREVE
 12. Hoy es ${dateStr}
 `;
@@ -1010,7 +1006,6 @@ async function handleWhatsApp(event) {
       session.awaitingName = false;
       session.pendingConfirmDraft = null;
 
-      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…", flowToken);
       try {
         await confirmBooking(
           phone,
@@ -1027,6 +1022,39 @@ async function handleWhatsApp(event) {
         await clearSession(phone);
       } catch (err) {
         const slots = await getAvailableHours(draft.date, draft.sport);
+        session.slots = slots;
+        session.options = buildOptions(slots, session.duration || 1);
+        session.hours = startTimesFromOptions(session.options);
+        const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
+        if (suggestions.length) {
+          const timeList = suggestions.map(o => o.start).join(", ");
+          await safeSendText(phone, `No pude confirmar. Te puedo ofrecer: ${timeList}.`, flowToken);
+        } else {
+          await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
+        }
+        await saveSession(phone, session);
+      }
+      return { actions: [] };
+    }
+
+    if (session.pendingConfirm && isYes(normalizedText)) {
+      const confirm = session.pendingConfirm;
+      try {
+        await confirmBooking(
+          phone,
+          confirm.date,
+          confirm.times,
+          confirm.court,
+          confirm.name,
+          confirm.lastName || "",
+          session.user?.id,
+          session.sport,
+          session.user?.found ? "usuario" : "invitado"
+        );
+        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
+        await clearSession(phone);
+      } catch (err) {
+        const slots = await getAvailableHours(confirm.date, session.sport);
         session.slots = slots;
         session.options = buildOptions(slots, session.duration || 1);
         session.hours = startTimesFromOptions(session.options);
@@ -1123,7 +1151,7 @@ async function handleWhatsApp(event) {
       
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
       const timeList = suggestions.map(o => o.start).join(", ");
-      const msgText = decision.message || `Estos son los horarios disponibles para ${session.sport} el ${formatDateEs(session.date)}:\n\n${timeList}\n\n¿A qué hora te gustaría?`;
+      const msgText = decision.message || `Para ${session.sport} el ${formatDateEs(session.date)}, tenemos: ${timeList}\n\n¿A qué hora prefieres?`;
       await safeSendText(phone, msgText, flowToken);
       await saveSession(phone, session);
       return { actions: [] };
@@ -1166,7 +1194,9 @@ async function handleWhatsApp(event) {
       }
       
       const reservationName = name || session.user?.name || "Cliente";
-      const summaryMsg = `📋 Confirma tu reserva:\n🎾 ${session.sport}\n📅 ${formatDateEs(session.date)}\n🕐 ${formatTimeRange(match.times)}\n\n¿Todo bien? Responde Sí para confirmar.`;
+      const dateFormatted = formatDateEs(session.date);
+      const timeFormatted = formatTimeRange(match.times);
+      const summaryMsg = `Perfecto, ${session.user?.name || 'aquí'}. Entonces confirmamos: ${session.sport} el ${dateFormatted} a las ${timeFormatted}. ¿Te parece bien?`;
       session.pendingConfirm = {
         date: session.date,
         times: match.times,
@@ -1378,7 +1408,6 @@ async function handleWhatsApp(event) {
   if (session.pendingConfirm) {
     if (isYes(normalizedText)) {
       const { date, times, court, name, lastName } = session.pendingConfirm;
-      await safeSendText(phone, "Perfecto, estoy confirmando tu reserva…", flowToken);
       try {
         await confirmBooking(
           phone,
