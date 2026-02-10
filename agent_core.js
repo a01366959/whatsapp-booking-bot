@@ -873,12 +873,14 @@ INFORMACIÓN DEL CLUB:
 REGLAS PARA RESPONDER:
 1. Sé amable, cálida y conversacional como una recepcionista real
 2. NUNCA digas "Voy a buscar", "Un momento", "Déjame revisar" - acciona directamente
-3. Si el usuario pregunta UBICACIÓN/DIRECCIÓN → action=send_location (pin de Google Maps)
-4. DEPORTE + FECHA (sin hora) → action=get_hours (muestra lista, NO shows opciones, NO confirm)
-   Ej: "Padel mañana" || "Quiero Pickleball el 11"
-5. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directamente)
-   Ej: "Padel el 11 a las 3" || "Quiero jugar mañana a las 15:00" 
-   Ej: Si user dice "15:00" después que mostraste horarios → action=confirm_reserva
+3. NUNCA digas "Claro, aquí están..." o "Aquí tienes..." sin mostrar contenido - usa get_hours para mostrar
+4. Si el usuario pregunta UBICACIÓN/DIRECCIÓN/COMO LLEGAR → action=send_location (pin de Google Maps)
+5. Si pregunta "¿Qué horarios tienes?" + DEPORTE + FECHA → action=get_hours (SIEMPRE get_hours, NO reply)
+6. DEPORTE + FECHA (sin hora específica) → action=get_hours (muestra lista solo si NO tiene hora en mente)
+  Ej: "Padel mañana" || "Quiero Pickleball el 11"
+7. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directo)
+  Ej: "Padel el 11 a las 3" || "Quiero jugar mañana a las 15:00"
+  Ej: Si user dice "15:00" después que mostraste horarios → action=confirm_reserva
 6. Si pregunta solo info (ubicación, horarios del club, instalaciones) → action=reply (breve)
 7. Si quiere reservar pero faltan datos → action=ask
 8. El nombre se guarda en params.name cuando lo menciona directamente
@@ -1103,7 +1105,7 @@ async function handleWhatsApp(event) {
     const confidence = computeConfidence(decision, interpretation, session);
     await logEvent("decision", { action: decision.action, confidence, phone });
 
-    const isLocationQuestion = /\b(d[óo]nde|ubicad|direcci[óo]n|ubicaci[óo]n|adresse|estamos)\b/i.test(text);
+    const isLocationQuestion = /\b(d[óo]nde|ubicad|direcci[óo]n|ubicaci[óo]n|adresse|estamos|llegar)\b/i.test(text);
     const isInfoOnly = isLocationQuestion || 
       /\b(horario|abren|cuando|cierran|instalacion|regla|politica|precio|costo|tarifa|cancelacion|reembolso)\b/i.test(text);
     
@@ -1149,9 +1151,52 @@ async function handleWhatsApp(event) {
         return { actions: [] };
       }
       
+      if (session.desiredTime) {
+        const match = session.options?.find(o => o.start === session.desiredTime);
+        if (match) {
+          const name = session.user?.name || "";
+          const lastName = session.userLastName || "";
+          if (!name && !session.user?.found) {
+            session.awaitingName = true;
+            session.pendingConfirmDraft = {
+              date: session.date,
+              times: match.times,
+              court: match.court,
+              sport: session.sport
+            };
+            await safeSendText(phone, "¿A nombre de quién hago la reserva? (Nombre y apellido)", flowToken);
+            await saveSession(phone, session);
+            return { actions: [] };
+          }
+          const reservationName = name || "Cliente";
+          const dateFormatted = formatDateEs(session.date);
+          const timeFormatted = formatTimeRange(match.times);
+          const summaryMsg = `Perfecto, ${reservationName}. Entonces confirmamos: ${session.sport} el ${dateFormatted} a las ${timeFormatted}. ¿Te parece bien?`;
+          session.pendingConfirm = {
+            date: session.date,
+            times: match.times,
+            court: match.court,
+            name: reservationName,
+            lastName: lastName
+          };
+          await safeSendText(phone, summaryMsg, flowToken);
+          await saveSession(phone, session);
+          return { actions: [] };
+        }
+        const suggestions = pickClosestOptions(session.options, session.desiredTime);
+        const timeList = suggestions.map(o => o.start).join(", ");
+        if (!timeList) {
+          await safeSendText(phone, "No tengo ese horario. ¿Quieres otra hora?", flowToken);
+          await saveSession(phone, session);
+          return { actions: [] };
+        }
+        await safeSendText(phone, `No tengo ${session.desiredTime}. Tengo ${timeList}. ¿Te funciona alguno?`, flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
       const timeList = suggestions.map(o => o.start).join(", ");
-      const msgText = decision.message || `Para ${session.sport} el ${formatDateEs(session.date)}, tenemos: ${timeList}\n\n¿A qué hora prefieres?`;
+      const msgText = `Para ${session.sport} el ${formatDateEs(session.date)}, tengo: ${timeList}\n\n¿A qué hora prefieres?`;
       await safeSendText(phone, msgText, flowToken);
       await saveSession(phone, session);
       return { actions: [] };
