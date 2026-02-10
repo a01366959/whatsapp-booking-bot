@@ -1,35 +1,116 @@
-/******************************************************************
- * FULL AI AGENT — WHATSAPP (REDIS FIXED)
- ******************************************************************/
-import express from "express";
 import axios from "axios";
-import OpenAI from "openai";
-import { Redis } from "@upstash/redis";
 import { randomUUID } from "crypto";
-import { init as initAgentCore } from "./agent_core.js";
-import { createWhatsAppAdapter } from "./adapters/whatsapp.js";
 
-const app = express();
-app.use(express.json());
+let deps = {};
+let openai;
+let redis;
+let senders;
+let logger;
+let config;
 
-/******************************************************************
- * CLIENTS
- ******************************************************************/
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const BUBBLE_REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const WEEKDAY_INDEX = {
+  domingo: 0,
+  lunes: 1,
+  martes: 2,
+  miercoles: 3,
+  jueves: 4,
+  viernes: 5,
+  sabado: 6
+};
+const MONTH_INDEX = {
+  enero: 1,
+  febrero: 2,
+  marzo: 3,
+  abril: 4,
+  mayo: 5,
+  junio: 6,
+  julio: 7,
+  agosto: 8,
+  septiembre: 9,
+  setiembre: 9,
+  octubre: 10,
+  noviembre: 11,
+  diciembre: 12
+};
+const SPANISH_NUMBERS = {
+  un: 1,
+  uno: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10
+};
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN
-});
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "get_user",
+      description: "Buscar usuario por teléfono para obtener nombre.",
+      parameters: {
+        type: "object",
+        properties: { phone: { type: "string" } },
+        required: ["phone"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_hours",
+      description: "Obtener horarios disponibles para una fecha.",
+      parameters: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "YYYY-MM-DD" },
+          sport: { type: "string" }
+        },
+        required: ["date"],
+        additionalProperties: false
+      }
+    }
+  }
+];
 
-/******************************************************************
- * CONSTANTS
- ******************************************************************/
-const WHATSAPP_API = `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`;
-const RAW_BUBBLE_BASE = (process.env.BUBBLE_BASE_URL || "").trim();
-const normalizeBubbleBase = raw => {
+export function init(dependencies = {}) {
+  deps = dependencies;
+  openai = deps.openai;
+  redis = deps.redis;
+  senders = deps.senders || {};
+  logger = deps.logger || console;
+  config = {
+    bubbleBaseUrl: normalizeBubbleBase(deps.config?.bubbleBaseUrl || ""),
+    bubbleToken: deps.config?.bubbleToken || "",
+    confirmEndpoint: deps.config?.confirmEndpoint || "confirm_reserva",
+    defaultSport: deps.config?.defaultSport || "Padel",
+    maxButtons: Number(deps.config?.maxButtons || 3),
+    mexicoTz: deps.config?.mexicoTz || "America/Mexico_City",
+    useAgent: deps.config?.useAgent !== undefined ? Boolean(deps.config.useAgent) : true,
+    staffPhone: deps.config?.staffPhone
+  };
+  return { handleIncoming };
+}
+
+export async function handleIncoming(event) {
+  if (!event?.channel) throw new Error("event.channel is required");
+  if (event.channel !== "whatsapp") {
+    await logEvent("unsupported_channel", { channel: event.channel });
+    return { actions: [] };
+  }
+  return handleWhatsApp(event);
+}
+
+function normalizeBubbleBase(raw) {
   if (!raw) return "";
-  let base = raw.replace(/\/$/, "");
+  let base = raw.trim().replace(/\/$/, "");
   if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
   base = base.replace(/^http:\/\//i, "https://");
   base = base.replace(/\/api\/1\.1\/wf$/i, "");
@@ -43,61 +124,48 @@ const normalizeBubbleBase = raw => {
     // ignore
   }
   return `${base}/api/1.1/wf`;
-};
-const BUBBLE = normalizeBubbleBase(RAW_BUBBLE_BASE);
-const DEFAULT_SPORT = "Padel";
-const MAX_BUTTONS = 3;
-const MEXICO_TZ = "America/Mexico_City";
-const CONFIRM_ENDPOINT = process.env.BUBBLE_CONFIRM_ENDPOINT || "confirm_reserva";
-const USE_AGENT = true;
+}
 
-const BUBBLE_HEADERS = {
-  Authorization: `Bearer ${process.env.BUBBLE_TOKEN}`
-};
-const BUBBLE_REDIRECTS = new Set([301, 302, 303, 307, 308]);
-
-const buildBubbleUrl = path => `${BUBBLE}${path.startsWith("/") ? "" : "/"}${path}`;
+function buildBubbleUrl(path) {
+  const base = config.bubbleBaseUrl || "";
+  return `${base}${path.startsWith("/") ? "" : "/"}${path}`;
+}
 
 async function bubbleRequest(method, path, { params, data } = {}) {
   const url = buildBubbleUrl(path);
-  const config = {
+  const headers = config.bubbleToken ? { Authorization: `Bearer ${config.bubbleToken}` } : {};
+  const requestConfig = {
     method,
     url,
     params,
     data,
-    headers: BUBBLE_HEADERS,
+    headers,
     maxRedirects: 0,
     validateStatus: status => (status >= 200 && status < 400) || BUBBLE_REDIRECTS.has(status)
   };
-
-  // Retry with exponential backoff for transient errors
   const maxAttempts = 3;
   let attempt = 0;
   let lastErr = null;
   while (attempt < maxAttempts) {
     attempt += 1;
     try {
-      let res = await axios.request(config);
+      let res = await axios.request(requestConfig);
       if (BUBBLE_REDIRECTS.has(res.status) && res.headers?.location) {
         const redirectedUrl = new URL(res.headers.location, url).toString();
-        res = await axios.request({ ...config, url: redirectedUrl });
+        res = await axios.request({ ...requestConfig, url: redirectedUrl });
       }
       return res;
     } catch (err) {
       lastErr = err;
       const status = err?.response?.status;
-      // don't retry for 4xx errors
       if (status && status >= 400 && status < 500) break;
       const backoff = 100 * Math.pow(2, attempt - 1);
-      await new Promise(r => setTimeout(r, backoff));
+      await new Promise(resolve => setTimeout(resolve, backoff));
     }
   }
   throw lastErr;
 }
 
-/******************************************************************
- * SYSTEM PROMPT (AGENTE)
- ******************************************************************/
 const SYSTEM_MESSAGE = {
   role: "system",
   content: `
@@ -123,61 +191,17 @@ Responde en español, corto y claro.
 `
 };
 
-/******************************************************************
- * HELPERS
- ******************************************************************/
 const normalizePhone = p => {
-  const digits = p.replace(/\D/g, "");
+  const digits = (p || "").replace(/\D/g, "");
   if (digits.length <= 10) return digits;
   return digits.slice(-10);
 };
 
 const normalizeText = text =>
-  text
+  (text || "")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
-
-const WEEKDAY_INDEX = {
-  domingo: 0,
-  lunes: 1,
-  martes: 2,
-  miercoles: 3,
-  jueves: 4,
-  viernes: 5,
-  sabado: 6
-};
-
-const MONTH_INDEX = {
-  enero: 1,
-  febrero: 2,
-  marzo: 3,
-  abril: 4,
-  mayo: 5,
-  junio: 6,
-  julio: 7,
-  agosto: 8,
-  septiembre: 9,
-  setiembre: 9,
-  octubre: 10,
-  noviembre: 11,
-  diciembre: 12
-};
-
-const SPANISH_NUMBERS = {
-  un: 1,
-  uno: 1,
-  una: 1,
-  dos: 2,
-  tres: 3,
-  cuatro: 4,
-  cinco: 5,
-  seis: 6,
-  siete: 7,
-  ocho: 8,
-  nueve: 9,
-  diez: 10
-};
 
 const parseDayMonth = t => {
   const m = t.match(/\b(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?\b/);
@@ -198,8 +222,31 @@ const parseRelativeDays = t => {
   return Number.isFinite(n) ? n : null;
 };
 
+const getMexicoDateParts = () => {
+  const dt = new Date();
+  const dateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: config.mexicoTz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(dt);
+  const hour = Number(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: config.mexicoTz,
+      hour: "2-digit",
+      hour12: false
+    }).format(dt)
+  );
+  const weekdayRaw = new Intl.DateTimeFormat("es-MX", {
+    timeZone: config.mexicoTz,
+    weekday: "long"
+  }).format(dt);
+  const weekday = WEEKDAY_INDEX[normalizeText(weekdayRaw)] ?? 0;
+  return { dateStr, hour, weekdayIndex: weekday };
+};
+
 const resolveDate = text => {
-  const t = normalizeText(text);
+  const t = normalizeText(text || "");
   const { dateStr, weekdayIndex } = getMexicoDateParts();
   const base = new Date(`${dateStr}T00:00:00Z`);
 
@@ -250,41 +297,18 @@ const toBubbleDate = dateStr => {
   return `${dateStr}T00:00:00Z`;
 };
 
-const getMexicoDateParts = () => {
-  const dt = new Date();
-  const dateStr = new Intl.DateTimeFormat("en-CA", {
-    timeZone: MEXICO_TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(dt);
-  const hour = Number(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone: MEXICO_TZ,
-      hour: "2-digit",
-      hour12: false
-    }).format(dt)
-  );
-  const weekdayRaw = new Intl.DateTimeFormat("es-MX", {
-    timeZone: MEXICO_TZ,
-    weekday: "long"
-  }).format(dt);
-  const weekday = WEEKDAY_INDEX[normalizeText(weekdayRaw)] ?? 0;
-  return { dateStr, hour, weekdayIndex: weekday };
-};
-
 const extractTime = text => {
-  const t = normalizeText(text);
+  const t = normalizeText(text || "");
   if (/\bde\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/.test(t)) {
     return null;
   }
-  const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  const m = (text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (m) {
     const hh = m[1].padStart(2, "0");
     const mm = m[2];
     return `${hh}:${mm}`;
   }
-  const m2 = text.match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm)?\b/i);
+  const m2 = (text || "").match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm)?\b/i);
   if (!m2) return null;
   let hour = Number(m2[1]);
   const mer = (m2[2] || "").toLowerCase();
@@ -293,47 +317,8 @@ const extractTime = text => {
   return `${String(hour).padStart(2, "0")}:00`;
 };
 
-const isGreeting = text =>
-  /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text);
-
-const hasBookingIntent = text =>
-  /\b(reservar|reserva|resev|resevar|reserbar|agendar|agenda|apart(ar)?|cancha|horario|jugar|juego|jugará)\b/i.test(text);
-
-const isYes = text =>
-  /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text);
-const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text);
-const wantsOtherTimes = text =>
-  /\b(otra\s+hora|otras\s+horas|que\s+otra|qué\s+otra|opciones|alternativas|diferente|más\s+tarde|mas\s+tarde|más\s+temprano|mas\s+temprano)\b/i.test(
-    text
-  );
-const wantsAvailability = text =>
-  /\b(horarios|disponibilidad|disponible|espacios|que\s+horarios)\b/i.test(text);
-
-const isInfoQuestion = text =>
-  /\b(que\s+pasa|qué\s+pasa|llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|politica|política|regla|cancel|reagend|reembolso|devolucion|precio|costo|tarifa|ubicacion|ubicación|direccion|dirección|estacionamiento|clases|torneos|renta|rentar)\b/i.test(
-    text
-  );
-
-const isNameQuestion = text =>
-  /\b(como\s+te\s+llamas|cual\s+es\s+tu\s+nombre|quien\s+eres)\b/i.test(text);
-
-const isLateQuestion = text =>
-  /\b(llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|voy\s+a\s+llegar\s+tarde)\b/i.test(text);
-
-const formatDateEs = dateStr => {
-  if (!dateStr) return "";
-  const d = new Date(dateStr.includes("T") ? dateStr : `${dateStr}T00:00:00Z`);
-  if (Number.isNaN(d.getTime())) return dateStr;
-  return new Intl.DateTimeFormat("es-MX", {
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-    timeZone: "UTC"
-  }).format(d);
-};
-
 const extractSport = text => {
-  const t = normalizeText(text);
+  const t = normalizeText(text || "");
   if (t.includes("pickle")) return "Pickleball";
   if (t.includes("golf")) return "Golf";
   if (t.includes("padel") || t.includes("paddel") || t.includes("pádel")) return "Padel";
@@ -341,13 +326,18 @@ const extractSport = text => {
 };
 
 const extractDuration = text => {
-  const t = normalizeText(text);
+  const t = normalizeText(text || "");
   const m = t.match(/\b(\d+)\s*hora/);
   if (m) return Number(m[1]);
   if (t.includes("una hora")) return 1;
   if (t.includes("dos horas")) return 2;
   if (t.includes("tres horas")) return 3;
   return null;
+};
+
+const hourToNumber = timeStr => {
+  const m = timeStr?.match(/^(\d{2}):/);
+  return m ? Number(m[1]) : null;
 };
 
 const addHours = (timeStr, inc) => {
@@ -395,12 +385,11 @@ const uniqueStarts = options => {
   return Array.from(map.values());
 };
 
-const startTimesFromOptions = options =>
-  uniqueStarts(options).map(o => o.start);
+const startTimesFromOptions = options => uniqueStarts(options).map(o => o.start);
 
 const pickClosestOptions = (options, desiredTime) => {
   const unique = uniqueStarts(options);
-  if (!desiredTime) return unique.slice(0, MAX_BUTTONS);
+  if (!desiredTime) return unique.slice(0, config.maxButtons);
   const target = hourToNumber(desiredTime);
   return unique
     .sort((a, b) => {
@@ -408,7 +397,19 @@ const pickClosestOptions = (options, desiredTime) => {
       const db = Math.abs(hourToNumber(b.start) - target);
       return da - db;
     })
-    .slice(0, MAX_BUTTONS);
+    .slice(0, config.maxButtons);
+};
+
+const formatDateEs = dateStr => {
+  if (!dateStr) return "";
+  const d = new Date(dateStr.includes("T") ? dateStr : `${dateStr}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return dateStr;
+  return new Intl.DateTimeFormat("es-MX", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC"
+  }).format(d);
 };
 
 const formatTimeRange = times => {
@@ -416,15 +417,11 @@ const formatTimeRange = times => {
   if (times.length === 1) return times[0];
   return `${times[0]} a ${times[times.length - 1]}`;
 };
-const hourToNumber = timeStr => {
-  const m = timeStr?.match(/^(\d{2}):/);
-  return m ? Number(m[1]) : null;
-};
 
 const suggestClosestHours = (hours, desiredTime) => {
   if (!hours?.length) return [];
   const desiredHour = hourToNumber(desiredTime);
-  if (desiredHour === null) return hours.slice(0, MAX_BUTTONS);
+  if (desiredHour === null) return hours.slice(0, config.maxButtons);
   const sorted = [...hours].sort();
   const before = [];
   const after = [];
@@ -438,22 +435,94 @@ const suggestClosestHours = (hours, desiredTime) => {
   if (after.length) suggestions.push(after[0]);
   if (after.length > 1) suggestions.push(after[1]);
   if (before.length) suggestions.push(before[before.length - 1]);
-  return [...new Set(suggestions)].slice(0, MAX_BUTTONS);
+  return [...new Set(suggestions)].slice(0, config.maxButtons);
 };
-/******************************************************************
- * REDIS SESSION
- ******************************************************************/
-const getSession = phone => redis.get(`session:${phone}`);
+
+const isGreeting = text =>
+  /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text || "");
+
+const hasBookingIntent = text =>
+  /\b(reservar|reserva|resev|resevar|reserbar|agendar|agenda|apart(ar)?|cancha|horario|jugar|juego|jugará)\b/i.test(text || "");
+
+const isYes = text => /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text || "");
+const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text || "");
+
+const wantsOtherTimes = text =>
+  /\b(otra\s+hora|otras\s+horas|que\s+otra|qué\s+otra|opciones|alternativas|diferente|más\s+tarde|mas\s+tarde|más\s+temprano|mas\s+temprano)\b/i.test(
+    text || ""
+  );
+
+const wantsAvailability = text =>
+  /\b(horarios|disponibilidad|disponible|espacios|que\s+horarios)\b/i.test(text || "");
+
+const isInfoQuestion = text =>
+  /\b(que\s+pasa|qué\s+pasa|llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|politica|política|regla|cancel|reagend|reembolso|devolucion|precio|costo|tarifa|ubicacion|ubicación|direccion|dirección|estacionamiento|clases|torneos|renta|rentar)\b/i.test(
+    text || ""
+  );
+
+const isNameQuestion = text => /\b(como\s+te\s+llamas|cual\s+es\s+tu\s+nombre|quien\s+eres)\b/i.test(text || "");
+
+const isLateQuestion = text =>
+  /\b(llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|voy\s+a\s+llegar\s+tarde)\b/i.test(text || "");
+
+async function logEvent(type, payload = {}) {
+  const ev = { type, payload, ts: new Date().toISOString() };
+  try {
+    if (redis?.lpush) await redis.lpush("telemetry", JSON.stringify(ev));
+  } catch {
+    // ignore telemetry failures
+  }
+  logger?.info?.("EVENT", ev);
+}
+
+async function escalateToHuman(phone, reason, session = {}) {
+  await logEvent("escalation", {
+    phone,
+    reason,
+    sessionSummary: { date: session.date, sport: session.sport, desiredTime: session.desiredTime }
+  });
+  const staff = config.staffPhone || process.env.STAFF_PHONE;
+  if (staff) {
+    try {
+      await safeSendText(staff, `Escalation: ${phone} — ${reason}`);
+    } catch (err) {
+      logger?.error?.("escalateToHuman notify staff failed", err?.message || err);
+    }
+  }
+}
+
+function computeConfidence(decision, interpretation, session) {
+  if (!decision) return 0;
+  if (decision.action === "confirm_reserva") return 0.95;
+  if (decision.action === "get_hours") return 0.9;
+  if (decision.action === "get_user") return 0.85;
+  if (interpretation?.intent === "book") {
+    const hasDate = Boolean(session.date || interpretation.date);
+    const hasSport = Boolean(session.sport || interpretation.sport);
+    if (hasDate && hasSport) return 0.85;
+    if (hasDate || hasSport) return 0.6;
+    return 0.5;
+  }
+  if (decision.action === "ask") return 0.65;
+  if (decision.action === "reply") return 0.5;
+  return 0.4;
+}
+
+const getSession = phone => redis?.get ? redis.get(`session:${phone}`) : null;
 const saveSession = (phone, session) =>
-  redis.set(`session:${phone}`, session, { ex: 1800 });
-const clearSession = phone => redis.del(`session:${phone}`);
+  redis?.set ? redis.set(`session:${phone}`, session, { ex: 1800 }) : Promise.resolve();
+const clearSession = phone => (redis?.del ? redis.del(`session:${phone}`) : Promise.resolve());
 
-const markMessageProcessed = async id =>
-  redis.set(`msg:${id}`, 1, { nx: true, ex: 86400 });
+const markMessageProcessed = async id => {
+  if (!redis?.set) return true;
+  const res = await redis.set(`msg:${id}`, 1, { nx: true, ex: 86400 });
+  return Boolean(res);
+};
 
-const getFlowToken = phone => redis.get(`flow:${phone}`);
+const getFlowToken = phone => (redis?.get ? redis.get(`flow:${phone}`) : null);
 const setFlowToken = (phone, token) =>
-  redis.set(`flow:${phone}`, token, { ex: 86400 });
+  redis?.set ? redis.set(`flow:${phone}`, token, { ex: 86400 }) : Promise.resolve();
+
 const ensureFlowToken = async phone => {
   let token = await getFlowToken(phone);
   if (!token) {
@@ -463,54 +532,42 @@ const ensureFlowToken = async phone => {
   return token;
 };
 
-// Telemetry helper: stores lightweight events in Redis and logs to console.
-async function logEvent(type, payload = {}) {
-  const ev = { type, payload, ts: new Date().toISOString() };
+async function safeSendText(to, text, flowToken) {
+  if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
+  }
   try {
-    await redis.lpush("telemetry", JSON.stringify(ev));
-  } catch (e) {
-    // ignore telemetry failures
-  }
-  console.log("EVENT:", JSON.stringify(ev));
-}
-
-// Simple escalation: notify staff via configured STAFF_PHONE and log the event.
-async function escalateToHuman(phone, reason, session = {}) {
-  await logEvent("escalation", { phone, reason, sessionSummary: { date: session.date, sport: session.sport, desiredTime: session.desiredTime } });
-  const staff = process.env.STAFF_PHONE;
-  if (staff) {
-    try {
-      await safeSendText(staff, `Escalation: ${phone} — ${reason}`);
-    } catch (e) {
-      console.error("escalateToHuman: notify staff failed", e?.message || e);
-    }
+    if (!senders?.text) throw new Error("text sender not configured");
+    await senders.text(to, text);
+    await logEvent("send_text", { to, text });
+    return { ok: true };
+  } catch (err) {
+    logger?.error?.("sendText failed", err?.response?.data || err?.message || err);
+    await logEvent("send_text_error", { to, message: err?.message || "unknown" });
+    return { ok: false, error: "sendText_failed" };
   }
 }
 
-// Very small heuristic confidence scorer to decide whether to escalate.
-function computeConfidence(decision, interpretation, session) {
-  // High confidence for direct actions
-  if (!decision) return 0.0;
-  if (decision.action === "confirm_reserva") return 0.95;
-  if (decision.action === "get_hours") return 0.9;
-  if (decision.action === "get_user") return 0.85;
-  // If interpretation strongly indicates a booking and core fields present
-  if (interpretation?.intent === "book") {
-    const hasDate = Boolean(session.date || interpretation.date);
-    const hasSport = Boolean(session.sport || interpretation.sport);
-    if (hasDate && hasSport) return 0.85;
-    if (hasDate || hasSport) return 0.6;
-    return 0.5;
+async function safeSendButtons(to, text, buttons, flowToken) {
+  if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
   }
-  // Fallbacks
-  if (decision.action === "ask") return 0.65;
-  if (decision.action === "reply") return 0.5;
-  return 0.4;
+  try {
+    if (!senders?.buttons) throw new Error("buttons sender not configured");
+    await senders.buttons(to, text, buttons);
+    await logEvent("send_buttons", { to, text, buttons });
+    return { ok: true };
+  } catch (err) {
+    logger?.error?.("sendButtons failed", err?.response?.data || err?.message || err);
+    await logEvent("send_buttons_error", { to, message: err?.message || "unknown" });
+    return { ok: false, error: "sendButtons_failed" };
+  }
 }
 
-/******************************************************************
- * BUBBLE
- ******************************************************************/
 async function findUser(phone) {
   const r = await bubbleRequest("get", "/get_user", { params: { phone } });
   return r.data?.response || { found: false };
@@ -522,12 +579,11 @@ async function getAvailableHours(date, desiredSport) {
   const currentTimeNumber = hour;
   const r = await bubbleRequest("get", "/get_hours", {
     params: {
-      sport: desiredSport || DEFAULT_SPORT,
+      sport: desiredSport || config.defaultSport,
       date: bubbleDate,
       current_time_number: currentTimeNumber
     }
   });
-
   return r.data?.response?.hours || [];
 }
 
@@ -538,66 +594,32 @@ async function confirmBooking(phone, date, times, court, name, lastName, userId,
     date: bubbleDate,
     time: times,
     court,
-    sport: sport || DEFAULT_SPORT,
+    sport: sport || config.defaultSport,
     user_type: userType
   };
   if (name) basePayload.name = name;
   if (lastName) basePayload.last_name = lastName;
   const withUser = userId ? { ...basePayload, user: userId } : basePayload;
   try {
-    await bubbleRequest("post", `/${CONFIRM_ENDPOINT}`, { data: withUser });
+    await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: withUser });
   } catch (err) {
-    console.error("confirmBooking failed", {
-      baseURL: BUBBLE,
+    logger?.error?.("confirmBooking failed", {
+      baseURL: config.bubbleBaseUrl,
       url: err?.config?.url,
       method: err?.config?.method,
       statusCode: err?.response?.status,
       data: err?.response?.data
     });
     if (userId) {
-      await bubbleRequest("post", `/${CONFIRM_ENDPOINT}`, { data: basePayload });
+      await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: basePayload });
       return;
     }
     throw err;
   }
 }
 
-/******************************************************************
- * OPENAI (AGENT LOOP)
- ******************************************************************/
-const TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "get_user",
-      description: "Buscar usuario por teléfono para obtener nombre.",
-      parameters: {
-        type: "object",
-        properties: { phone: { type: "string" } },
-        required: ["phone"],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "get_hours",
-      description: "Obtener horarios disponibles para una fecha.",
-      parameters: {
-        type: "object",
-        properties: {
-          date: { type: "string", description: "YYYY-MM-DD" },
-          sport: { type: "string" }
-        },
-        required: ["date"],
-        additionalProperties: false
-      }
-    }
-  },
-];
-
 async function interpretMessage(session, userText) {
+  if (!openai) return { intent: "other" };
   const { dateStr } = getMexicoDateParts();
   const sys = `
 Eres Michelle, recepcionista humana de Black Padel, Pickleball & Golf (México).
@@ -626,7 +648,7 @@ Hoy en México es ${dateStr}.
 
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: deps.config?.interpretModel || "gpt-4.1-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
@@ -649,6 +671,7 @@ Hoy en México es ${dateStr}.
 }
 
 async function runAgent(session, userText) {
+  if (!openai) return { finalText: "¿Te ayudo con algo del club?", messages: [] };
   const context = [
     SYSTEM_MESSAGE,
     {
@@ -661,7 +684,7 @@ async function runAgent(session, userText) {
 - user_last_name: ${session.userLastName || "desconocido"}
 - date: ${session.date || "null"}
 - hours: ${session.hours?.length ? session.hours.join(", ") : "null"}
-- sport: ${session.sport || DEFAULT_SPORT}
+- sport: ${session.sport || config.defaultSport}
 - duration: ${session.duration || 1}`
     },
     ...session.messages.filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
@@ -674,7 +697,7 @@ async function runAgent(session, userText) {
   while (!finalText && guard < 4) {
     guard += 1;
     const response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: deps.config?.agentModel || "gpt-4.1-mini",
       messages,
       tools: TOOLS,
       tool_choice: "auto",
@@ -707,7 +730,7 @@ async function runAgent(session, userText) {
           if (result?.last_name) session.userLastName = result.last_name;
         } else if (name === "get_hours") {
           const date = args.date || session.date;
-          const sport = args.sport || DEFAULT_SPORT;
+          const sport = args.sport || config.defaultSport;
           if (!date) {
             result = { ok: false, error: "missing_date" };
           } else {
@@ -742,6 +765,7 @@ async function runAgent(session, userText) {
 }
 
 async function agentDecide(session, userText) {
+  if (!openai) return { action: "reply", message: "¿Me repites, por favor?", params: {} };
   const { dateStr } = getMexicoDateParts();
   const system = `
 Eres Michelle, recepcionista humana de Black Padel, Pickleball & Golf.
@@ -783,7 +807,7 @@ Reglas:
   ];
   try {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: deps.config?.decideModel || "gpt-4.1-mini",
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
@@ -795,118 +819,29 @@ Reglas:
   }
 }
 
-/******************************************************************
- * WHATSAPP
- ******************************************************************/
-const sendText = (to, text) =>
-  axios.post(
-    WHATSAPP_API,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text }
-    },
-    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
-  );
-
-const sendButtons = (to, text, buttons) =>
-  axios.post(
-    WHATSAPP_API,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text },
-        action: { buttons }
-      }
-    },
-    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
-  );
-
-const agentLogger = {
-  info: (...args) => console.log("[agent-core]", ...args),
-  error: (...args) => console.error("[agent-core]", ...args)
-};
-
-const agentCore = initAgentCore({
-  openai,
-  redis,
-  senders: {
-    text: sendText,
-    buttons: sendButtons
-  },
-  logger: agentLogger,
-  config: {
-    bubbleBaseUrl: process.env.BUBBLE_BASE_URL || "",
-    bubbleToken: process.env.BUBBLE_TOKEN || "",
-    confirmEndpoint: CONFIRM_ENDPOINT,
-    defaultSport: DEFAULT_SPORT,
-    maxButtons: MAX_BUTTONS,
-    mexicoTz: MEXICO_TZ,
-    useAgent: USE_AGENT,
-    staffPhone: process.env.STAFF_PHONE
-  }
-});
-
-const whatsappAdapter = createWhatsAppAdapter({ agentCore });
-
-async function safeSendText(to, text, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    await sendText(to, text);
-    return { ok: true };
-  } catch (err) {
-    console.error("sendText failed", err?.response?.data || err?.message || err);
-    return { ok: false, error: "sendText_failed" };
-  }
-}
-
-async function safeSendButtons(to, text, buttons, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    await sendButtons(to, text, buttons);
-    return { ok: true };
-  } catch (err) {
-    console.error("sendButtons failed", err?.response?.data || err?.message || err);
-    return { ok: false, error: "sendButtons_failed" };
-  }
-}
-
-/******************************************************************
- * WEBHOOK
- ******************************************************************/
-app.post("/webhook", async (req, res) => {
-  return whatsappAdapter.handleWebhook(req, res);
-  const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-  if (!msg) return res.sendStatus(200);
+async function handleWhatsApp(event) {
+  const msg = event.raw;
+  if (!msg) return { actions: [] };
 
   const msgId = msg.id;
   if (msgId) {
     const firstTime = await markMessageProcessed(msgId);
-    if (!firstTime) return res.sendStatus(200);
+    if (!firstTime) return { actions: [] };
   }
 
-  const phone = normalizePhone(msg.from);
+  const phone = normalizePhone(msg.from || event.phone || "");
+  if (!phone) return { actions: [] };
+
   const text =
     msg.text?.body ||
     msg.button?.text ||
     msg.interactive?.button_reply?.title ||
     msg.interactive?.button_reply?.id ||
+    event.text ||
     "";
   const normalizedText = text.trim().toLowerCase();
   const cleanText = normalizeText(text);
-  const msgTs = Number(msg.timestamp || 0);
+  const msgTs = Number(msg.timestamp || event.ts || 0);
 
   const flowToken = await ensureFlowToken(phone);
 
@@ -942,20 +877,19 @@ app.post("/webhook", async (req, res) => {
   session.justFetchedHours = false;
 
   if (msgTs && session.lastTs && msgTs < session.lastTs) {
-    return res.sendStatus(200);
+    return { actions: [] };
   }
   if (msgTs) session.lastTs = msgTs;
 
-  // Reset manual para pruebas
   if (normalizedText === "reset") {
     const newToken = randomUUID();
     await setFlowToken(phone, newToken);
     await clearSession(phone);
     await safeSendText(phone, "Listo, reinicié la conversación.", newToken);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
-  if (USE_AGENT) {
+  if (config.useAgent) {
     const decision = await agentDecide(session, text);
     const params = decision.params || {};
     if (params.sport) session.sport = params.sport;
@@ -968,24 +902,22 @@ app.post("/webhook", async (req, res) => {
     }
     if (params.last_name) session.userLastName = params.last_name;
 
-    // Compute confidence for this decision and record it.
-    const confidence = computeConfidence(decision, null, session);
+    const interpretation = null;
+    const confidence = computeConfidence(decision, interpretation, session);
     await logEvent("decision", { action: decision.action, confidence, phone });
 
-    // If confidence is very low, offer a human and notify staff.
     if (confidence < 0.45) {
       session.awaitingHuman = true;
       await escalateToHuman(phone, "low_confidence", session);
       await safeSendText(phone, "No estoy segura de eso. ¿Quieres que te pase con un agente humano?", flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
 
     const missingSport = !session.sport;
     const missingDate = !session.date;
     const missingTime = !session.desiredTime;
 
-    // Si el LLM pide datos que ya tenemos, corrige la acción
     if (decision.action === "ask" && !missingSport && !missingDate) {
       decision.action = "get_hours";
     }
@@ -1000,7 +932,7 @@ app.post("/webhook", async (req, res) => {
         const ask = decision.message || "¿Para qué deporte y fecha?";
         await safeSendText(phone, ask, flowToken);
         await saveSession(phone, session);
-        return res.sendStatus(200);
+        return { actions: [] };
       }
       const slots = await getAvailableHours(session.date, session.sport);
       session.slots = slots;
@@ -1018,7 +950,7 @@ app.post("/webhook", async (req, res) => {
         flowToken
       );
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
 
     if (decision.action === "confirm_reserva") {
@@ -1026,7 +958,7 @@ app.post("/webhook", async (req, res) => {
       if (!match) {
         await safeSendText(phone, "No tengo ese horario. ¿Quieres otra hora?", flowToken);
         await saveSession(phone, session);
-        return res.sendStatus(200);
+        return { actions: [] };
       }
       const name = params.name || session.user?.name || "Cliente";
       const lastName = params.last_name || session.userLastName || "";
@@ -1067,7 +999,7 @@ app.post("/webhook", async (req, res) => {
         }
         await saveSession(phone, session);
       }
-      return res.sendStatus(200);
+      return { actions: [] };
     }
 
     if (decision.action === "ask") {
@@ -1084,20 +1016,19 @@ app.post("/webhook", async (req, res) => {
                 : "¿Me ayudas con un dato más?");
       await safeSendText(phone, ask, flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
 
     if (decision.action === "reply") {
       await safeSendText(phone, decision.message || "¿Te ayudo con algo más?", flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
   }
 
   const interpretation =
     !session.pendingConfirm && !session.pendingTime ? await interpretMessage(session, text) : null;
 
-  // Fecha / deporte / duración directos (sin IA)
   const prevDate = session.date;
   const prevSport = session.sport;
   const parsedDate = interpretation?.date || resolveDate(text);
@@ -1120,14 +1051,12 @@ app.post("/webhook", async (req, res) => {
       session.options = [];
       session.hours = null;
     }
-    // If the user just answered the sport and we still need a date,
-    // continue the booking flow by asking for the date immediately.
     if (!session.date) {
       session.awaitingDate = true;
       const ask = interpretation?.reply || "¿Para qué fecha te gustaría reservar?";
       await safeSendText(phone, ask, flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
   }
   const parsedDuration = interpretation?.duration || extractDuration(text);
@@ -1151,7 +1080,7 @@ app.post("/webhook", async (req, res) => {
     session.duration = 3;
     await safeSendText(phone, "El máximo es 3 horas. ¿Te parece 3 horas?", flowToken);
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
   if (parsedDuration && session.slots?.length) {
     session.options = buildOptions(session.slots, session.duration || 1);
@@ -1166,7 +1095,7 @@ app.post("/webhook", async (req, res) => {
   if (!interpretation && isNameQuestion(cleanText)) {
     await safeSendText(phone, "Soy Michelle, recepcionista del club. ¿En qué te ayudo?", flowToken);
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   if (!interpretation && isLateQuestion(cleanText)) {
@@ -1176,7 +1105,7 @@ app.post("/webhook", async (req, res) => {
       flowToken
     );
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   const infoQuestion = isInfoQuestion(cleanText);
@@ -1198,7 +1127,7 @@ app.post("/webhook", async (req, res) => {
     if (reply) {
       await safeSendText(phone, reply, flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
     const { finalText, messages } = await runAgent(session, text);
     await safeSendText(phone, finalText, flowToken);
@@ -1206,7 +1135,7 @@ app.post("/webhook", async (req, res) => {
       .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
       .slice(-12);
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   if (bookingIntent && !session.sport) {
@@ -1214,7 +1143,7 @@ app.post("/webhook", async (req, res) => {
     const ask = interpretation?.reply || "¿Para qué deporte quieres reservar? (Padel, Pickleball o Golf)";
     await safeSendText(phone, ask, flowToken);
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   if (bookingIntent && !session.date) {
@@ -1222,7 +1151,7 @@ app.post("/webhook", async (req, res) => {
     const ask = interpretation?.reply || "¿Para qué fecha te gustaría reservar?";
     await safeSendText(phone, ask, flowToken);
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   if (session.noAvailabilityDate && wantsAvailability(cleanText)) {
@@ -1232,10 +1161,9 @@ app.post("/webhook", async (req, res) => {
       flowToken
     );
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
-  // Si el usuario pide otras horas y ya tenemos opciones, responder con opciones
   if (session.options?.length && wantsOtherTimes(cleanText)) {
     const suggestions = pickClosestOptions(session.options, session.desiredTime);
     const buttons = suggestions.map(o => ({
@@ -1248,10 +1176,9 @@ app.post("/webhook", async (req, res) => {
     await safeSendButtons(phone, msgText, buttons, flowToken);
     session.awaitingTime = true;
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
-  // Si estamos esperando confirmación final
   if (session.pendingConfirm) {
     if (isYes(normalizedText)) {
       const { date, times, court, name, lastName } = session.pendingConfirm;
@@ -1271,7 +1198,7 @@ app.post("/webhook", async (req, res) => {
         await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
         await clearSession(phone);
       } catch (err) {
-        console.error("confirmBooking failed", err?.response?.data || err?.message || err);
+        logger?.error?.("confirmBooking failed", err?.response?.data || err?.message || err);
         const slots = await getAvailableHours(session.date, session.sport);
         session.slots = slots;
         session.options = buildOptions(slots, session.duration || 1);
@@ -1294,17 +1221,16 @@ app.post("/webhook", async (req, res) => {
         session.pendingConfirm = null;
         await saveSession(phone, session);
       }
-      return res.sendStatus(200);
+      return { actions: [] };
     }
     if (isNo(normalizedText)) {
       session.pendingConfirm = null;
       await safeSendText(phone, "Entendido. ¿Qué horario prefieres?", flowToken);
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
   }
 
-  // Si ya tenemos horarios y el usuario manda una hora, pedir confirmación
   const timeCandidate = extractTime(text);
   if (timeCandidate) {
     session.desiredTime = timeCandidate;
@@ -1315,7 +1241,7 @@ app.post("/webhook", async (req, res) => {
           session.pendingTime = timeCandidate;
           await safeSendText(phone, "¿A nombre de quién hago la reserva? (Nombre y apellido)", flowToken);
           await saveSession(phone, session);
-          return res.sendStatus(200);
+          return { actions: [] };
         }
         session.pendingConfirm = {
           date: session.date,
@@ -1332,7 +1258,7 @@ app.post("/webhook", async (req, res) => {
           flowToken
         );
         await saveSession(phone, session);
-        return res.sendStatus(200);
+        return { actions: [] };
       }
       const suggestions = pickClosestOptions(session.options, timeCandidate);
       const buttons = suggestions.map(o => ({
@@ -1346,11 +1272,10 @@ app.post("/webhook", async (req, res) => {
         flowToken
       );
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
   }
 
-  // Si es un saludo inicial, no repetir saludo ni romper el flujo
   if (isNewSession && isGreeting(text) && !hasBookingIntent(cleanText)) {
     if (!session.user) {
       session.user = await findUser(phone);
@@ -1364,10 +1289,9 @@ app.post("/webhook", async (req, res) => {
     );
     session.messages.push({ role: "assistant", content: "saludo" });
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
-  // Si estamos esperando nombre, usar el siguiente mensaje como nombre
   if (session.pendingTime) {
     session.user = session.user || { found: false };
     const fullName = text.trim().split(/\s+/);
@@ -1378,7 +1302,7 @@ app.post("/webhook", async (req, res) => {
       await safeSendText(phone, "Esa hora ya no está disponible. ¿Qué horario prefieres?", flowToken);
       session.pendingTime = null;
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
     session.pendingConfirm = {
       date: session.date,
@@ -1396,7 +1320,7 @@ app.post("/webhook", async (req, res) => {
       flowToken
     );
     await saveSession(phone, session);
-    return res.sendStatus(200);
+    return { actions: [] };
   }
 
   if (bookingIntent) {
@@ -1414,7 +1338,7 @@ app.post("/webhook", async (req, res) => {
           flowToken
         );
         await saveSession(phone, session);
-        return res.sendStatus(200);
+        return { actions: [] };
       }
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
       const buttons = suggestions.map(o => ({
@@ -1429,25 +1353,17 @@ app.post("/webhook", async (req, res) => {
       await safeSendButtons(phone, msg, buttons, flowToken);
       session.awaitingTime = true;
       await saveSession(phone, session);
-      return res.sendStatus(200);
+      return { actions: [] };
     }
   }
 
   const { finalText, messages } = await runAgent(session, text);
-
   await safeSendText(phone, finalText, flowToken);
-
   session.messages = messages
     .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
     .slice(-12);
-
   await saveSession(phone, session);
-  res.sendStatus(200);
-});
+  return { actions: [] };
+}
 
-/******************************************************************
- * SERVER
- ******************************************************************/
-app.listen(process.env.PORT || 3000, () => {
-  console.log("FULL AI AGENT RUNNING (REDIS)");
-});
+export default { init, handleIncoming };
