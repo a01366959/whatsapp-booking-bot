@@ -629,6 +629,31 @@ async function safeSendLocation(to, latitude, longitude, name, address, flowToke
   }
 }
 
+async function safeSendList(to, bodyText, buttonText, sections, flowToken) {
+  if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
+  }
+  try {
+    if (!senders?.list) {
+      logger?.warn?.("list sender not configured, falling back to text");
+      const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
+      await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
+      return { ok: true };
+    }
+    await senders.list(to, bodyText, buttonText, sections);
+    await logEvent("send_list", { to, bodyText, sectionsCount: sections.length });
+    return { ok: true };
+  } catch (err) {
+    logger?.error?.("sendList failed", err?.response?.data || err?.message || err);
+    logger?.warn?.("falling back to text message for list");
+    const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
+    await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
+    return { ok: true };
+  }
+}
+
 async function findUser(phone) {
   const r = await bubbleRequest("get", "/get_user", { params: { phone } });
   return r.data?.response || { found: false };
@@ -876,7 +901,9 @@ REGLAS PARA RESPONDER:
 3. NUNCA digas "Claro, aquí están..." o "Aquí tienes..." sin mostrar contenido - usa get_hours para mostrar
 4. Si el usuario pregunta UBICACIÓN/DIRECCIÓN/COMO LLEGAR → action=send_location (pin de Google Maps)
 5. Si pregunta "¿Qué horarios tienes?" + DEPORTE + FECHA → action=get_hours (SIEMPRE get_hours, NO reply)
-6. DEPORTE + FECHA (sin hora específica) → action=get_hours (muestra lista solo si NO tiene hora en mente)
+6. Si pregunta "Tienes más horas?" o "Dame más opciones" → action=reply + message="[MOSTRAR_MAS]"
+7. Si dice "más tarde" o "más temprano" en contexto de horarios → extrae eso como preferencia en params.time
+8. DEPORTE + FECHA (sin hora específica) → action=get_hours (muestra lista solo si NO tiene hora en mente)
   Ej: "Padel mañana" || "Quiero Pickleball el 11"
 7. DEPORTE + FECHA + HORA → action=confirm_reserva (el usuario ya eligió, confirma directo)
   Ej: "Padel el 11 a las 3" || "Quiero jugar mañana a las 15:00"
@@ -940,6 +967,8 @@ async function handleWhatsApp(event) {
     msg.button?.text ||
     msg.interactive?.button_reply?.title ||
     msg.interactive?.button_reply?.id ||
+    msg.interactive?.list_reply?.title ||
+    msg.interactive?.list_reply?.id ||
     event.text ||
     "";
   const normalizedText = text.trim().toLowerCase();
@@ -1039,9 +1068,56 @@ async function handleWhatsApp(event) {
       return { actions: [] };
     }
 
-    if (session.pendingConfirm && isYes(normalizedText)) {
-      const confirm = session.pendingConfirm;
-      try {
+    if (session.pendingConfirm) {
+      const asksForChange = /\b(mejor|otro|diferente|cambiar|mas\s+tarde|más\s+tarde|mas\s+temprano|más\s+temprano|m[aá]s\s+(hora|opcion))\b/i.test(text);
+      if (isNo(normalizedText) || asksForChange) {
+        const asksLater = /\b(m[aá]s\s+tarde|tarde)\b/i.test(text);
+        const asksEarlier = /\b(m[aá]s\s+temprano|temprano)\b/i.test(text);
+        
+        session.pendingConfirm = null;
+        session.desiredTime = null;
+        
+        if ((asksLater || asksEarlier) && session.options?.length) {
+          const allStarts = startTimesFromOptions(session.options);
+          let filteredStarts = allStarts;
+          
+          if (asksLater) {
+            filteredStarts = allStarts.filter(t => {
+              const h = parseInt(t.split(':')[0]);
+              return h >= 14;
+            });
+          } else if (asksEarlier) {
+            filteredStarts = allStarts.filter(t => {
+              const h = parseInt(t.split(':')[0]);
+              return h < 14;
+            });
+          }
+          
+          if (filteredStarts.length > 0) {
+            const bodyText = asksLater 
+              ? `Para la tarde, tengo estos horarios:`
+              : `Por la mañana, tengo estos horarios:`;
+            
+            const rows = filteredStarts.map((time, idx) => ({
+              id: `time_${idx}_${time.replace(':', '')}`,
+              title: time,
+              description: `${session.sport} - ${formatDateEs(session.date)}`
+            }));
+            
+            const sections = [{ title: "Horarios", rows }];
+            await safeSendList(phone, bodyText, "Ver horarios", sections, flowToken);
+            await saveSession(phone, session);
+            return { actions: [] };
+          }
+        }
+        
+        await safeSendText(phone, "Claro, sin problema. ¿A qué hora te gustaría?", flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
+      if (isYes(normalizedText)) {
+        const confirm = session.pendingConfirm;
+        try {
         await confirmBooking(
           phone,
           confirm.date,
@@ -1070,6 +1146,8 @@ async function handleWhatsApp(event) {
         await saveSession(phone, session);
       }
       return { actions: [] };
+      }
+      return { actions: [] };
     }
 
     if (!session.userChecked) {
@@ -1083,6 +1161,55 @@ async function handleWhatsApp(event) {
     const decision = await agentDecide(session, text);
     logger?.info?.(`[AGENT DECISION] action=${decision.action}, params=${JSON.stringify(decision.params || {})}`);
     const params = decision.params || {};
+    
+    const asksForMore = /\b(m[aá]s\s+(hora|opcion|horario)|tienes\s+m[aá]s|dame\s+m[aá]s|otra|diferente)\b/i.test(text);
+    const asksLater = /\b(m[aá]s\s+tarde|tarde|despu[eé]s|afternoon|evening)\b/i.test(text);
+    const asksEarlier = /\b(m[aá]s\s+temprano|temprano|ma[nñ]ana|morning)\b/i.test(text);
+    
+    if (asksForMore && session.options?.length && session.sport && session.date) {
+      session.desiredTime = null;
+      session.pendingConfirm = null;
+      const allStarts = startTimesFromOptions(session.options);
+      let filteredStarts = allStarts;
+      
+      if (asksLater) {
+        const now = new Date();
+        const currentHour = now.getHours();
+        filteredStarts = allStarts.filter(t => {
+          const h = parseInt(t.split(':')[0]);
+          return h >= 14;
+        });
+      } else if (asksEarlier) {
+        filteredStarts = allStarts.filter(t => {
+          const h = parseInt(t.split(':')[0]);
+          return h < 14;
+        });
+      }
+      
+      if (filteredStarts.length === 0) {
+        await safeSendText(phone, "No tengo horarios en ese rango. ¿Quieres ver todas las opciones?", flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
+      
+      const bodyText = asksLater 
+        ? `Para la tarde, tengo estos horarios:`
+        : asksEarlier
+        ? `Por la mañana, tengo estos horarios:`
+        : `Todos los horarios disponibles:`;
+      
+      const rows = filteredStarts.map((time, idx) => ({
+        id: `time_${idx}_${time.replace(':', '')}`,
+        title: time,
+        description: `${session.sport} - ${formatDateEs(session.date)}`
+      }));
+      
+      const sections = [{ title: "Horarios", rows }];
+      await safeSendList(phone, bodyText, "Ver horarios", sections, flowToken);
+      await saveSession(phone, session);
+      return { actions: [] };
+    }
+    
     if (params.sport) session.sport = params.sport;
     if (params.date) session.date = params.date;
     if (params.time) session.desiredTime = params.time;
@@ -1194,10 +1321,17 @@ async function handleWhatsApp(event) {
         await saveSession(phone, session);
         return { actions: [] };
       }
-      const suggestions = pickClosestOptions(session.options, session.desiredTime);
-      const timeList = suggestions.map(o => o.start).join(", ");
-      const msgText = `Para ${session.sport} el ${formatDateEs(session.date)}, tengo: ${timeList}\n\n¿A qué hora prefieres?`;
-      await safeSendText(phone, msgText, flowToken);
+      const allStarts = startTimesFromOptions(session.options);
+      const bodyText = `Para ${session.sport} el ${formatDateEs(session.date)}, tengo estos horarios:`;
+      
+      const rows = allStarts.map((time, idx) => ({
+        id: `time_${idx}_${time.replace(':', '')}`,
+        title: time,
+        description: `${session.sport} - ${formatDateEs(session.date)}`
+      }));
+      
+      const sections = [{ title: "Horarios disponibles", rows }];
+      await safeSendList(phone, bodyText, "Ver horarios", sections, flowToken);
       await saveSession(phone, session);
       return { actions: [] };
     }

@@ -843,6 +843,25 @@ const sendLocation = (to, { latitude, longitude, name, address }) =>
     { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
   );
 
+const sendList = (to, bodyText, buttonText, sections) =>
+  axios.post(
+    WHATSAPP_API,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "list",
+        body: { text: bodyText },
+        action: {
+          button: buttonText,
+          sections: sections
+        }
+      }
+    },
+    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
+  );
+
 const agentLogger = {
   info: (...args) => console.log("[agent-core]", ...args),
   error: (...args) => console.error("[agent-core]", ...args)
@@ -854,7 +873,8 @@ const agentCore = initAgentCore({
   senders: {
     text: sendText,
     buttons: sendButtons,
-    location: sendLocation
+    location: sendLocation,
+    list: sendList
   },
   logger: agentLogger,
   config: {
