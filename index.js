@@ -826,6 +826,23 @@ const sendButtons = (to, text, buttons) =>
     { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
   );
 
+const sendLocation = (to, { latitude, longitude, name, address }) =>
+  axios.post(
+    WHATSAPP_API,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "location",
+      location: {
+        latitude,
+        longitude,
+        name,
+        address
+      }
+    },
+    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
+  );
+
 const agentLogger = {
   info: (...args) => console.log("[agent-core]", ...args),
   error: (...args) => console.error("[agent-core]", ...args)
@@ -836,7 +853,8 @@ const agentCore = initAgentCore({
   redis,
   senders: {
     text: sendText,
-    buttons: sendButtons
+    buttons: sendButtons,
+    location: sendLocation
   },
   logger: agentLogger,
   config: {

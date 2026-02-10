@@ -179,13 +179,18 @@ const CLUB_INFO = {
   opening_hours: "Lunes a viernes de 7:00 a 22:00, Sábado y domingo de 8:00 a 15:00",
   courts: "2 canchas de Padel techadas, 2 canchas de Pickleball techadas, 1 simulador de Golf",
   amenities: "Baños, vestidores, tienda, bar, mesas, estacionamiento, WiFi",
-  services: "Reservas, clases, torneos, ligas, renta de equipo"
+  services: "Reservas, clases, torneos, ligas, renta de equipo",
+  location: {
+    latitude: 19.5256,
+    longitude: -99.2325,
+    address_short: "San Gaspar Tlahuelilpan, Estado de México"
+  }
 };
 
 const SYSTEM_MESSAGE = {
   role: "system",
   content: `
-Eres Michelle, recepcionista humana de Black Padel & Pickleball (México).
+Eres Michelle, recepcionista amable y cálida de Black Padel & Pickleball (México).
 
 INFORMACIÓN DEL CLUB:
 - Nombre: ${CLUB_INFO.name}
@@ -195,32 +200,31 @@ INFORMACIÓN DEL CLUB:
 - Instalaciones: ${CLUB_INFO.amenities}
 - Servicios: ${CLUB_INFO.services}
 - Estacionamiento: ${CLUB_INFO.parking}
-- Contacto: WhatsApp ${CLUB_INFO.whatsapp}, Email ${CLUB_INFO.email}
-- Instagram: ${CLUB_INFO.instagram}
+- Contacto: WhatsApp ${CLUB_INFO.whatsapp}, Instagram ${CLUB_INFO.instagram}
 - Google Maps: ${CLUB_INFO.maps_url}
+
+CÓMO CONVERSAR (MUY IMPORTANTE):\n- Sé amable, cálida y natural como una recepcionista real
+- Cuando respondas una pregunta sobre ubicación/horarios/instalaciones, añade una sugerencia natural como:
+  * Después de ubicación: "¿Te gustaría reservar una cancha?"
+  * Después de horarios: "¿Quieres revisar disponibilidad?"
+  * Después de instalaciones: "¿Te atrae jugar con nosotros?"
+- Usa el nombre del cliente cuando lo sepas (ejemplo: "Juan, ¡qué bueno!")
+- Habla con entusiasmo del club, como si fuera tu lugar favorito
+- NO seas robótico ni lista de hechos - crea conversación real
 
 REGLAS DURAS:
 - NO repitas saludos
-- NO inventes información - usa solo los datos del club arriba
+- NO inventes información - solo datos del club
 - NO respondas programación, código, temas técnicos, ilegales o fuera del club
 - Si preguntan algo fuera del club, responde educadamente que solo ayudas con temas del club
 - Si ya hay fecha, NO la pidas otra vez
-- Si ya hay horarios, NO preguntes horas
-- Si necesitas datos, pregunta de forma breve y natural
-- Si el usuario quiere reservar, pide solo lo mínimo (deporte, fecha, hora, duración)
-- Si la pregunta NO es de reserva, responde directo sin pedir deporte/fecha
-- Si el usuario te dice su nombre, recuérdalo y úsalo en conversaciones futuras
-- Si el usuario pregunta "como me llamo", usa el nombre que te dio previamente
-- Si preguntan ubicación, dirección, cómo llegar: da la dirección completa y el link de Google Maps
-- Si preguntan horarios: menciona los horarios exactos del club
-- Si preguntan qué canchas hay: menciona las 2 de Padel, 2 de Pickleball y 1 simulador de Golf, todas techadas
+- Si ya hay horarios cargados, NO los vuelvas a pedir
 
 HERRAMIENTAS:
 - get_user: obtener nombre del cliente por teléfono
 - get_hours: horarios disponibles por fecha
 
-Usa herramientas cuando ayuden. Si no tienes información, dilo.
-Responde en español, corto y claro.
+Responde en español, corto, claro y cálido.
 `
 };
 
@@ -601,6 +605,29 @@ async function safeSendButtons(to, text, buttons, flowToken) {
   }
 }
 
+async function safeSendLocation(to, latitude, longitude, name, address, flowToken) {
+  if (!to) return { ok: false, error: "missing_to" };
+  if (flowToken) {
+    const current = await getFlowToken(to);
+    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
+  }
+  try {
+    if (!senders?.location) {
+      logger?.warn?.("location sender not configured, sending as text");
+      await safeSendText(to, `📍 ${name}\n${address}`, flowToken);
+      return { ok: true };
+    }
+    await senders.location(to, { latitude, longitude, name, address });
+    await logEvent("send_location", { to, name, address });
+    return { ok: true };
+  } catch (err) {
+    logger?.error?.("sendLocation failed", err?.response?.data || err?.message || err);
+    logger?.warn?.("falling back to text message for location");
+    await safeSendText(to, `📍 ${name}\n${address}`, flowToken);
+    return { ok: true };
+  }
+}
+
 async function findUser(phone) {
   const r = await bubbleRequest("get", "/get_user", { params: { phone } });
   return r.data?.response || { found: false };
@@ -810,10 +837,10 @@ async function agentDecide(session, userText) {
   if (!openai) return { action: "reply", message: "¿Me repites, por favor?", params: {} };
   const { dateStr } = getMexicoDateParts();
   const system = `
-Eres Michelle, recepcionista humana de Black Padel & Pickleball.
+Eres Michelle, recepcionista amable y cálida de Black Padel & Pickleball.
 Devuelve SOLO JSON válido con este esquema:
 {
-  "action": "ask|reply|get_user|get_hours|confirm_reserva",
+  "action": "ask|reply|get_user|get_hours|confirm_reserva|send_location",
   "message": "texto para el usuario",
   "params": {
     "sport": "Padel|Pickleball|Golf|null",
@@ -825,32 +852,28 @@ Devuelve SOLO JSON válido con este esquema:
   }
 }
 
-INFORMACIÓN DEL CLUB (úsala para responder preguntas):
+INFORMACIÓN DEL CLUB:
 - Nombre: Black Padel & Pickleball
 - Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México, CP 52147
 - Horarios: Lunes a viernes 7:00-22:00, Sábado y domingo 8:00-15:00
 - Canchas: 2 Padel techadas, 2 Pickleball techadas, 1 simulador Golf
-- Estacionamiento gratuito
-- WhatsApp: +52 56 5440 7815
-- Instagram: @blackpadelandpickleball
+- Estacionamiento gratuito, WiFi, Bar, Tienda, Vestidores
+- WhatsApp: +52 56 5440 7815, Instagram: @blackpadelandpickleball
 - Google Maps: https://maps.app.goo.gl/7rVpWz5benMH9fHu5
 
-REGLAS IMPORTANTES:
-1. Si el usuario SOLO dice un nombre (ej: "Pablo"), guárdalo en params.name y responde "Mucho gusto, Pablo!"
-2. Si el usuario pregunta "como me llamo" y user_name existe, responde "Te llamas [user_name]"
-3. Si el usuario quiere reservar/jugar/agendar:
-   - SIN deporte ni fecha: action=ask, pregunta por deporte y fecha
-   - CON deporte SIN fecha: action=ask, pregunta por fecha
-   - CON deporte Y fecha PERO sin horarios cargados (has_options=false): action=get_hours
-   - CON horarios disponibles (has_options=true) Y el usuario elige hora: action=confirm_reserva
-4. Si pregunta ubicación/dirección/cómo llegar: action=reply con dirección completa y link de Maps
-5. Si pregunta horarios del club: action=reply con horarios exactos
-6. Si pregunta instalaciones/canchas/servicios: action=reply con info del club
-7. Si es otra pregunta general: action=reply
-8. Extrae siempre sport, date, time del mensaje si los menciona
-9. Fechas relativas: "hoy"=${dateStr}, "mañana"=día siguiente, etc.
-10. NO inventes información, usa solo los datos del club arriba
-11. NO repitas info que ya está en contexto
+REGLAS PARA RESPONDER:
+1. Sé amable, cálida y conversacional como una recepcionista real
+2. Cuando pregunten UBICACIÓN o DIRECCIÓN: action=send_location → envía un marker de Google Maps
+3. Después ubicación: ofrece ayuda natural ("¿Te gustaría reservar?")
+4. Cuando pregunten HORARIOS: action=reply con horarios exactos + sugerencia ("¿Quieres ver disponibilidad?")
+5. Cuando pregunten INSTALACIONES: action=reply con detalles del club + sugerencia
+6. Para reservas: sin deporte/fecha → action=ask; con ambos y opciones → action=confirm_reserva
+7. Usa el nombre del cliente cuando lo sepas
+8. Si SOLO dice un nombre: guárdalo en params.name
+9. Extrae sport, date, time si los menciona
+10. NO inventes información, NO repitas contexto
+11. El mensaje debe ser CONVERSACIONAL, no una lista
+12. Hoy es ${dateStr}
 `;
   const context = {
     user: session.user || null,
@@ -993,11 +1016,8 @@ async function handleWhatsApp(event) {
         session.hours = startTimesFromOptions(session.options);
         const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
         if (suggestions.length) {
-          const buttons = suggestions.map(o => ({
-            type: "reply",
-            reply: { id: o.start, title: o.start }
-          }));
-          await safeSendButtons(phone, "No pude confirmar. Te puedo ofrecer:", buttons, flowToken);
+          const timeList = suggestions.map(o => o.start).join(", ");
+          await safeSendText(phone, `No pude confirmar. Te puedo ofrecer: ${timeList}.`, flowToken);
         } else {
           await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
         }
@@ -1080,17 +1100,9 @@ async function handleWhatsApp(event) {
       }
       
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
-      const buttons = suggestions.map(o => ({
-        type: "reply",
-        reply: { id: o.start, title: o.start }
-      }));
-      const msgText = decision.message || `Estos son los horarios disponibles para ${session.sport} el ${formatDateEs(session.date)}:`;
-      await safeSendButtons(
-        phone,
-        msgText,
-        buttons,
-        flowToken
-      );
+      const timeList = suggestions.map(o => o.start).join(", ");
+      const msgText = decision.message || `Estos son los horarios disponibles para ${session.sport} el ${formatDateEs(session.date)}:\n\n${timeList}\n\n¿A qué hora te gustaría?`;
+      await safeSendText(phone, msgText, flowToken);
       await saveSession(phone, session);
       return { actions: [] };
     }
@@ -1104,6 +1116,7 @@ async function handleWhatsApp(event) {
       }
       const name = params.name || session.user?.name || "";
       const lastName = params.last_name || session.userLastName || "";
+      
       if (!name && !session.user?.found) {
         session.awaitingName = true;
         session.pendingConfirmDraft = {
@@ -1116,43 +1129,18 @@ async function handleWhatsApp(event) {
         await saveSession(phone, session);
         return { actions: [] };
       }
-      await safeSendText(phone, decision.message || "Perfecto, estoy confirmando tu reserva…", flowToken);
-      try {
-        await confirmBooking(
-          phone,
-          session.date,
-          match.times,
-          match.court,
-          name || "Cliente",
-          lastName,
-          session.user?.id,
-          session.sport,
-          session.user?.found ? "usuario" : "invitado"
-        );
-        await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
-        await clearSession(phone);
-      } catch (err) {
-        const slots = await getAvailableHours(session.date, session.sport);
-        session.slots = slots;
-        session.options = buildOptions(slots, session.duration || 1);
-        session.hours = startTimesFromOptions(session.options);
-        const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
-        if (suggestions.length) {
-          const buttons = suggestions.map(o => ({
-            type: "reply",
-            reply: { id: o.start, title: o.start }
-          }));
-          await safeSendButtons(
-            phone,
-            "No pude confirmar. Te puedo ofrecer:",
-            buttons,
-            flowToken
-          );
-        } else {
-          await safeSendText(phone, "No pude confirmar la reserva. ¿Quieres intentar otra hora?", flowToken);
-        }
-        await saveSession(phone, session);
-      }
+      
+      const reservationName = name || session.user?.name || "Cliente";
+      const summaryMsg = `📋 Confirma tu reserva:\n🎾 ${session.sport}\n📅 ${formatDateEs(session.date)}\n🕐 ${formatTimeRange(match.times)}\n\n¿Todo bien? Responde Sí para confirmar.`;
+      session.pendingConfirm = {
+        date: session.date,
+        times: match.times,
+        court: match.court,
+        name: reservationName,
+        lastName: lastName
+      };
+      await safeSendText(phone, summaryMsg, flowToken);
+      await saveSession(phone, session);
       return { actions: [] };
     }
 
@@ -1177,6 +1165,22 @@ async function handleWhatsApp(event) {
       const replyText = decision.message || "¿Te ayudo con algo más?";
       logger?.info?.(`[REPLY] message=${replyText}`);
       await safeSendText(phone, replyText, flowToken);
+      await saveSession(phone, session);
+      return { actions: [] };
+    }
+
+    if (decision.action === "send_location") {
+      const locationMsg = decision.message || "Aquí te dejo nuestra ubicación:";
+      logger?.info?.(`[SEND_LOCATION] message=${locationMsg}`);
+      await safeSendText(phone, locationMsg, flowToken);
+      await safeSendLocation(
+        phone,
+        CLUB_INFO.location.latitude,
+        CLUB_INFO.location.longitude,
+        CLUB_INFO.name,
+        CLUB_INFO.location.address,
+        flowToken
+      );
       await saveSession(phone, session);
       return { actions: [] };
     }
@@ -1326,14 +1330,11 @@ async function handleWhatsApp(event) {
 
   if (session.options?.length && wantsOtherTimes(cleanText)) {
     const suggestions = pickClosestOptions(session.options, session.desiredTime);
-    const buttons = suggestions.map(o => ({
-      type: "reply",
-      reply: { id: o.start, title: o.start }
-    }));
+    const timeList = suggestions.map(o => o.start).join(", ");
     const msgText = suggestions.length
-      ? `Te puedo ofrecer: ${suggestions.map(o => o.start).join(", ")}.`
+      ? `Te puedo ofrecer: ${timeList}.\n\n¿Cuál te late?`
       : "No tengo más opciones disponibles.";
-    await safeSendButtons(phone, msgText, buttons, flowToken);
+    await safeSendText(phone, msgText, flowToken);
     session.awaitingTime = true;
     await saveSession(phone, session);
     return { actions: [] };
@@ -1365,14 +1366,10 @@ async function handleWhatsApp(event) {
         session.hours = startTimesFromOptions(session.options);
         const suggestions = pickClosestOptions(session.options || [], session.desiredTime);
         if (suggestions.length) {
-          const buttons = suggestions.map(h => ({
-            type: "reply",
-            reply: { id: h.start, title: h.start }
-          }));
-          await safeSendButtons(
+          const timeList = suggestions.map(o => o.start).join(", ");
+          await safeSendText(
             phone,
-            `No pude confirmar. Te puedo ofrecer: ${suggestions.map(o => o.start).join(", ")}.`,
-            buttons,
+            `No pude confirmar. Te puedo ofrecer: ${timeList}.`,
             flowToken
           );
         } else {
@@ -1421,14 +1418,10 @@ async function handleWhatsApp(event) {
         return { actions: [] };
       }
       const suggestions = pickClosestOptions(session.options, timeCandidate);
-      const buttons = suggestions.map(o => ({
-        type: "reply",
-        reply: { id: o.start, title: o.start }
-      }));
-      await safeSendButtons(
+      const timeList = suggestions.map(o => o.start).join(", ");
+      await safeSendText(
         phone,
-        `No tengo ${timeCandidate} disponible. Te puedo ofrecer: ${suggestions.map(o => o.start).join(", ")}.`,
-        buttons,
+        `No tengo ${timeCandidate} disponible. Te puedo ofrecer: ${timeList}.`,
         flowToken
       );
       await saveSession(phone, session);
@@ -1501,16 +1494,11 @@ async function handleWhatsApp(event) {
         return { actions: [] };
       }
       const suggestions = pickClosestOptions(session.options, session.desiredTime);
-      const buttons = suggestions.map(o => ({
-        type: "reply",
-        reply: { id: o.start, title: o.start }
-      }));
+      const timeList = suggestions.map(o => o.start).join(", ");
       const msg = session.desiredTime
-        ? `No tengo ${session.desiredTime} disponible. Te puedo ofrecer: ${suggestions
-            .map(o => o.start)
-            .join(", ")}.`
-        : "¿A qué hora te gustaría reservar?";
-      await safeSendButtons(phone, msg, buttons, flowToken);
+        ? `No tengo ${session.desiredTime} disponible. Te puedo ofrecer: ${timeList}.`
+        : `¿A qué hora te gustaría reservar? Opciones disponibles: ${timeList}.`;
+      await safeSendText(phone, msg, flowToken);
       session.awaitingTime = true;
       await saveSession(phone, session);
       return { actions: [] };
