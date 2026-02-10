@@ -1014,6 +1014,15 @@ app.post("/webhook", async (req, res) => {
       session.options = [];
       session.hours = null;
     }
+    // If the user just answered the sport and we still need a date,
+    // continue the booking flow by asking for the date immediately.
+    if (!session.date) {
+      session.awaitingDate = true;
+      const ask = interpretation?.reply || "¿Para qué fecha te gustaría reservar?";
+      await safeSendText(phone, ask, flowToken);
+      await saveSession(phone, session);
+      return res.sendStatus(200);
+    }
   }
   const parsedDuration = interpretation?.duration || extractDuration(text);
   if (parsedDuration) {
