@@ -532,6 +532,7 @@ function computeConfidence(decision, interpretation, session) {
   if (!decision) return 0;
   if (decision.action === "confirm_reserva") return 0.95;
   if (decision.action === "get_hours") return 0.9;
+  if (decision.action === "send_location") return 0.9;
   if (decision.action === "get_user") return 0.85;
   if (interpretation?.intent === "book") {
     const hasDate = Boolean(session.date || interpretation.date);
@@ -845,12 +846,20 @@ Devuelve SOLO JSON válido con este esquema:
   "params": {
     "sport": "Padel|Pickleball|Golf|null",
     "date": "YYYY-MM-DD|null",
-    "time": "HH:MM|null",
+    "time": "HH:MM|null",  (formato 24h: "14:00" not "2:00pm" not "14:00pm")
     "duration_hours": 1|2|3|null,
     "name": "string|null",
     "last_name": "string|null"
   }
 }
+
+EJEMPLOS DE EXTRACCIÓN:
+- "14:00" o "14:30" → time: "14:00" o "14:30"
+- "A las 2:00pm" → time: "14:00"
+- "A las 3 de la tarde" → time: "15:00"
+- "Mañana" con sport/fecha anterior → date: YYYY-MM-DD (siguiente día)
+- "Padel mañana" → sport: "Padel", date: mañana
+- "Mi nombre es Juan Pérez" → name: "Juan", last_name: "Pérez"
 
 INFORMACIÓN DEL CLUB:
 - Nombre: Black Padel & Pickleball
@@ -863,16 +872,23 @@ INFORMACIÓN DEL CLUB:
 
 REGLAS PARA RESPONDER:
 1. Sé amable, cálida y conversacional como una recepcionista real
-2. Cuando pregunten UBICACIÓN o DIRECCIÓN: action=send_location → envía un marker de Google Maps
-3. Después ubicación: ofrece ayuda natural ("¿Te gustaría reservar?")
-4. Cuando pregunten HORARIOS: action=reply con horarios exactos + sugerencia ("¿Quieres ver disponibilidad?")
-5. Cuando pregunten INSTALACIONES: action=reply con detalles del club + sugerencia
-6. Para reservas: sin deporte/fecha → action=ask; con ambos y opciones → action=confirm_reserva
-7. Usa el nombre del cliente cuando lo sepas
-8. Si SOLO dice un nombre: guárdalo en params.name
-9. Extrae sport, date, time si los menciona
-10. NO inventes información, NO repitas contexto
-11. El mensaje debe ser CONVERSACIONAL, no una lista
+2. UBICACIÓN/DIRECCIÓN (palabras clave: "dónde", "ubicación", "ubicados", "dirección", "dirección", "ubicado", "adresse", "dirección"): 
+   → action=send_location (envía pin de Google Maps con coordenadas, después ofrece ayuda)
+3. HORARIOS GENERALES (palabras clave: "cuándo abren", "horarios", "a qué hora", "horario"): 
+   → action=reply con horarios exactos + sugerencia ("¿Quieres ver disponibilidad?")
+4. DEPORTE + FECHA (SIN HORARIOS CARGADOS): Si el usuario proporciona deporte Y fecha (ejemplo: "Padel mañana")
+   O si dice "sí" cuando se le pregunta sobre opciones:
+   → action=get_hours (carga horarios disponibles del API, NO reply, NO ask, NO confirm)
+5. DEPORTE + FECHA + HORARIOS YA CARGADOS (options_available=true) + USUARIO ELIGE HORA: 
+   → action=confirm_reserva
+6. Si el usuario SOLO pregunta por info (sin intención de reservar) → action=reply
+7. Si el usuario quiere reservar pero faltan datos → action=ask
+8. El nombre se guarda cuando el usuario lo menciona directamente (params.name)
+9. Contexto: Revisa campos "sport", "date", "options_available", "desired_time"
+   - Si sport + date pero NO options_available → get_hours
+   - Si sport + date + options_available → ask/confirm_reserva según si tiene time
+10. NO inventes información, NO repitas contexto, NO hagas listas
+11. El mensaje debe ser CONVERSACIONAL y BREVE
 12. Hoy es ${dateStr}
 `;
   const context = {
@@ -883,8 +899,8 @@ REGLAS PARA RESPONDER:
     date: session.date || null,
     desired_time: session.desiredTime || null,
     duration_hours: session.duration || 1,
-    available_starts: startTimesFromOptions(session.options || []),
-    has_options: Boolean(session.options?.length)
+    options_available: Boolean(session.options?.length),
+    available_starts: startTimesFromOptions(session.options || [])
   };
   const messages = [
     { role: "system", content: system },
@@ -1059,12 +1075,18 @@ async function handleWhatsApp(event) {
     const confidence = computeConfidence(decision, interpretation, session);
     await logEvent("decision", { action: decision.action, confidence, phone });
 
+    const isLocationQuestion = /\b(d[óo]nde|ubicad|direcci[óo]n|ubicaci[óo]n|adresse|estamos)\b/i.test(text);
+    const isInfoOnly = isLocationQuestion || 
+      /\b(horario|abren|cuando|cierran|instalacion|regla|politica|precio|costo|tarifa|cancelacion|reembolso)\b/i.test(text);
+    
     if (confidence < 0.45) {
-      session.awaitingHuman = true;
-      await escalateToHuman(phone, "low_confidence", session);
-      await safeSendText(phone, "No estoy segura de eso. ¿Quieres que te pase con un agente humano?", flowToken);
-      await saveSession(phone, session);
-      return { actions: [] };
+      if (!isInfoOnly && !decision.action.match(/reply|send_location/)) {
+        session.awaitingHuman = true;
+        await escalateToHuman(phone, "low_confidence", session);
+        await safeSendText(phone, "No estoy segura de eso. ¿Quieres que te pase con un agente humano?", flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
     }
 
     const missingSport = !session.sport;
@@ -1108,6 +1130,19 @@ async function handleWhatsApp(event) {
     }
 
     if (decision.action === "confirm_reserva") {
+      if (!session.desiredTime) {
+        const suggestions = session.options?.length > 0 ? pickClosestOptions(session.options, null) : [];
+        if (suggestions.length === 0) {
+          await safeSendText(phone, `No tengo horarios disponibles para ${formatDateEs(session.date)}. ¿Quieres revisar otra fecha?`, flowToken);
+          session.date = null;
+          await saveSession(phone, session);
+          return { actions: [] };
+        }
+        const timeList = suggestions.map(o => o.start).join(", ");
+        await safeSendText(phone, `Opciones disponibles: ${timeList}\n\n¿Cuál prefieres?`, flowToken);
+        await saveSession(phone, session);
+        return { actions: [] };
+      }
       const match = session.options?.find(o => o.start === session.desiredTime);
       if (!match) {
         await safeSendText(phone, "No tengo ese horario. ¿Quieres otra hora?", flowToken);
