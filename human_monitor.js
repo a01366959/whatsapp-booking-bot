@@ -242,7 +242,7 @@ export async function getActiveConversations() {
     const conversations = [];
 
     // Process in pairs: [phone, timestamp, phone, timestamp, ...]
-    for (let i = 0; i <activePhones.length; i += 2) {
+    for (let i = 0; i < activePhones.length; i += 2) {
       const phone = activePhones[i];
       const lastActivity = activePhones[i + 1];
 
