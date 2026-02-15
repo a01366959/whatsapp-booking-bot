@@ -241,27 +241,11 @@ export async function getActiveConversations() {
 
     const conversations = [];
 
-    // ioredis returns array of objects when withScores: true
-    // Format: [{ member: 'phone1', score: 123 }, { member: 'phone2', score: 456 }, ...]
-    // OR flat array: ['phone1', 123, 'phone2', 456, ...]
-    
-    // Determine format and extract data accordingly
-    let phoneScorePairs = [];
-    
-    if (Array.isArray(activePhones) && activePhones.length > 0) {
-      if (typeof activePhones[0] === 'object' && activePhones[0].member) {
-        // Object format from ioredis v5+
-        phoneScorePairs = activePhones.map(item => [item.member, item.score]);
-      } else {
-        // Flat array format
-        for (let i = 0; i < activePhones.length; i += 2) {
-          phoneScorePairs.push([activePhones[i], activePhones[i + 1]]);
-        }
-      }
-    }
+    // Process in pairs: [phone, timestamp, phone, timestamp, ...]
+    for (let i = 0; i < activePhones.length; i += 2) {
+      const phone = activePhones[i];
+      const lastActivity = activePhones[i + 1];
 
-    // Process each phone/score pair
-    for (const [phone, lastActivity] of phoneScorePairs) {
       // Get last message
       const messages = await getConversation(phone, 1);
       const lastMessage = messages[messages.length - 1];
@@ -271,7 +255,15 @@ export async function getActiveConversations() {
 
       // Check if escalated
       const escalation = await redis.get(`escalation:${phone}`);
-      const escalationData = escalation ? JSON.parse(escalation) : null;
+      let escalationData = null;
+      if (escalation) {
+        try {
+          escalationData = typeof escalation === 'string' ? JSON.parse(escalation) : escalation;
+        } catch (e) {
+          logger.error(`[HumanMonitor] Failed to parse escalation for ${phone}:`, e);
+          escalationData = null;
+        }
+      }
 
       conversations.push({
         phone,
@@ -309,11 +301,12 @@ export async function getEscalationQueue() {
     return queue
       .map(item => {
         try {
-          const parsed = JSON.parse(item);
+          const parsed = typeof item === 'string' ? JSON.parse(item) : item;
           // Add readable date format for Bubble
           parsed.createdAt = new Date(parsed.timestamp).toISOString();
           return parsed;
-        } catch {
+        } catch (e) {
+          logger.error(`[HumanMonitor] Failed to parse escalation item:`, e);
           return null;
         }
       })
@@ -369,7 +362,8 @@ export async function archiveConversation(phone, metadata = {}) {
 
     const escalation = await redis.get(`escalation:${phone}`);
     if (escalation) {
-      await redis.zrem("escalations:queue", escalation);
+      const escalationStr = typeof escalation === 'string' ? escalation : JSON.stringify(escalation);
+      await redis.zrem("escalations:queue", escalationStr);
       await redis.del(`escalation:${phone}`);
     }
 
@@ -389,7 +383,9 @@ export async function clearEscalation(phone) {
   try {
     const escalation = await redis.get(`escalation:${phone}`);
     if (escalation) {
-      await redis.zrem("escalations:queue", escalation);
+      // Ensure we're using string format for removal from sorted set
+      const escalationStr = typeof escalation === 'string' ? escalation : JSON.stringify(escalation);
+      await redis.zrem("escalations:queue", escalationStr);
       await redis.del(`escalation:${phone}`);
       logger.info(`[HumanMonitor] Cleared escalation: ${phone}`);
     }
