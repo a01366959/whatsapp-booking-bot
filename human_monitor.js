@@ -136,12 +136,13 @@ export async function isHumanMode(phone) {
  * Enable human mode (pause AI, allow staff to respond)
  */
 export async function enableHumanMode(phone, staffName = "staff") {
-  if (!redis || !phone) return;
+  if (!redis) throw new Error("Redis not initialized");
+  if (!phone) throw new Error("Phone number required");
 
   try {
     await redis.set(`mode:${phone}`, "human", { ex: MESSAGE_TTL });
     await redis.set(`mode:${phone}:staff`, staffName, { ex: MESSAGE_TTL });
-    
+
     // Log takeover event
     await logMessage(phone, {
       sender: "system",
@@ -150,8 +151,10 @@ export async function enableHumanMode(phone, staffName = "staff") {
     });
 
     logger.info(`[HumanMonitor] Human mode enabled: ${phone} by ${staffName}`);
+    return { success: true, phone, staffName };
   } catch (err) {
     logger.error(`[HumanMonitor] Failed to enable human mode for ${phone}:`, err);
+    throw err;
   }
 }
 
@@ -159,14 +162,15 @@ export async function enableHumanMode(phone, staffName = "staff") {
  * Disable human mode (resume AI)
  */
 export async function disableHumanMode(phone) {
-  if (!redis || !phone) return;
+  if (!redis) throw new Error("Redis not initialized");
+  if (!phone) throw new Error("Phone number required");
 
   try {
     const staffName = await redis.get(`mode:${phone}:staff`) || "staff";
-    
+
     await redis.del(`mode:${phone}`);
     await redis.del(`mode:${phone}:staff`);
-    
+
     // Log release event
     await logMessage(phone, {
       sender: "system",
@@ -175,8 +179,10 @@ export async function disableHumanMode(phone) {
     });
 
     logger.info(`[HumanMonitor] Human mode disabled: ${phone}`);
+    return { success: true, phone };
   } catch (err) {
     logger.error(`[HumanMonitor] Failed to disable human mode for ${phone}:`, err);
+    throw err;
   }
 }
 
@@ -192,15 +198,24 @@ export async function getConversation(phone, limit = 50) {
 
   try {
     const key = `conversation:${phone}:messages`;
-    
+
     // Get last N messages (sorted by timestamp descending)
     const messages = await redis.zrange(key, -limit, -1, { rev: false });
-    
+
     return messages.map(msg => {
       try {
-        return JSON.parse(msg);
+        const parsed = JSON.parse(msg);
+        // Add readable date format for Bubble (ISO 8601)
+        parsed.createdAt = new Date(parsed.timestamp).toISOString();
+        return parsed;
       } catch {
-        return { sender: "system", text: msg, timestamp: Date.now() };
+        const now = Date.now();
+        return {
+          sender: "system",
+          text: msg,
+          timestamp: now,
+          createdAt: new Date(now).toISOString()
+        };
       }
     });
   } catch (err) {
@@ -219,15 +234,15 @@ export async function getActiveConversations() {
 
   try {
     // Get all active phones (sorted by last activity)
-    const activePhones = await redis.zrange("conversations:active", 0, -1, { 
-      rev: true, 
-      withScores: true 
+    const activePhones = await redis.zrange("conversations:active", 0, -1, {
+      rev: true,
+      withScores: true
     });
 
     const conversations = [];
-    
+
     // Process in pairs: [phone, timestamp, phone, timestamp, ...]
-    for (let i = 0; i < activePhones.length; i += 2) {
+    for (let i = 0; i <activePhones.length; i += 2) {
       const phone = activePhones[i];
       const lastActivity = activePhones[i + 1];
 
@@ -237,7 +252,7 @@ export async function getActiveConversations() {
 
       // Check mode
       const mode = await isHumanMode(phone) ? "human" : "ai";
-      
+
       // Check if escalated
       const escalation = await redis.get(`escalation:${phone}`);
       const escalationData = escalation ? JSON.parse(escalation) : null;
@@ -245,6 +260,7 @@ export async function getActiveConversations() {
       conversations.push({
         phone,
         lastActivity: Number(lastActivity),
+        lastActivityDate: new Date(Number(lastActivity)).toISOString(),
         lastMessage: lastMessage?.text || "",
         lastMessageSender: lastMessage?.sender || "unknown",
         mode,
@@ -262,25 +278,30 @@ export async function getActiveConversations() {
 
 /**
  * Get escalation queue (conversations waiting for human review)
- * 
+ *
  * @returns {Promise<Array>} Array of escalated conversations
  */
 export async function getEscalationQueue() {
   if (!redis) return [];
 
   try {
-    const queue = await redis.zrange("escalations:queue", 0, -1, { 
+    const queue = await redis.zrange("escalations:queue", 0, -1, {
       rev: true,
-      withScores: false 
+      withScores: false
     });
 
-    return queue.map(item => {
-      try {
-        return JSON.parse(item);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
+    return queue
+      .map(item => {
+        try {
+          const parsed = JSON.parse(item);
+          // Add readable date format for Bubble
+          parsed.createdAt = new Date(parsed.timestamp).toISOString();
+          return parsed;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
   } catch (err) {
     logger.error(`[HumanMonitor] Failed to get escalation queue:`, err);
     return [];
@@ -289,7 +310,7 @@ export async function getEscalationQueue() {
 
 /**
  * Archive a conversation to Bubble (for completed conversations)
- * 
+ *
  * @param {string} phone - User's phone number
  * @param {object} metadata - Conversation metadata (userName, bookingDetails, etc.)
  */
@@ -306,10 +327,13 @@ export async function archiveConversation(phone, metadata = {}) {
       messages,
       messageCount: messages.length,
       startTime: messages[0]?.timestamp || Date.now(),
+      startTimeDate: new Date(messages[0]?.timestamp || Date.now()).toISOString(),
       endTime: messages[messages.length - 1]?.timestamp || Date.now(),
+      endTimeDate: new Date(messages[messages.length - 1]?.timestamp || Date.now()).toISOString(),
       metadata: {
         ...metadata,
-        archivedAt: Date.now()
+        archivedAt: Date.now(),
+        archivedAtDate: new Date(Date.now()).toISOString()
       }
     };
 
@@ -326,7 +350,7 @@ export async function archiveConversation(phone, metadata = {}) {
 
     // Remove from active conversations and escalation queue
     await redis.zrem("conversations:active", phone);
-    
+
     const escalation = await redis.get(`escalation:${phone}`);
     if (escalation) {
       await redis.zrem("escalations:queue", escalation);
@@ -362,7 +386,9 @@ export async function clearEscalation(phone) {
  * Send message from human staff to user
  */
 export async function sendHumanMessage(phone, text, staffName, sendFn) {
-  if (!phone || !text || !sendFn) return;
+  if (!phone) throw new Error("Phone number required");
+  if (!text) throw new Error("Message text required");
+  if (!sendFn) throw new Error("Send function required");
 
   try {
     // Log the human message
@@ -376,6 +402,7 @@ export async function sendHumanMessage(phone, text, staffName, sendFn) {
     await sendFn(phone, text);
 
     logger.info(`[HumanMonitor] Human message sent: ${phone} by ${staffName}`);
+    return { success: true, phone, text };
   } catch (err) {
     logger.error(`[HumanMonitor] Failed to send human message to ${phone}:`, err);
     throw err;
