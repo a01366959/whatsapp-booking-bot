@@ -933,8 +933,9 @@ async function agentDecide(session, userText) {
 Eres Michelle, recepcionista amable y cálida de Black Padel & Pickleball.
 Devuelve SOLO JSON válido con este esquema:
 {
-  "action": "ask|reply|get_user|get_hours|confirm_reserva|send_location",
+  "action": "ask|reply|get_user|get_hours|confirm_reserva|send_location|subtle_escalate",
   "message": "texto para el usuario",
+  "reason": "opcional, motivo de escalada sutil",
   "params": {
     "sport": "Padel|Pickleball|Golf|null",
     "date": "YYYY-MM-DD|null",
@@ -978,12 +979,33 @@ REGLAS PARA RESPONDER:
   Ej: Si user dice "15:00" o número solo (en contexto) → action=confirm_reserva
 9. Si pregunta solo info (instalaciones, reglas) → action=reply (breve)
 10. Si quiere reservar pero faltan datos → action=ask
-7. Si quiere reservar pero faltan datos → action=ask
-8. El nombre se guarda en params.name cuando lo menciona directamente
-9. NO emojis, NO listas múltiples, respuestas naturales
-10. Hoy es ${dateStr}
-11. El mensaje debe ser CONVERSACIONAL y BREVE
-12. Hoy es ${dateStr}
+
+ESCALADA SUTIL (Sin que el usuario se entere):
+- usar action=subtle_escalate SOLO SI:
+  * Usuario pide hablar con dueño/gerente/manager/director
+  * Usuario hace reclamación/queja/reclamo seria
+  * Usuario pregunta sobre temas fuera del scope (políticas de cancelación, devoluciones, litigios)
+  * Preguntas muy personales o sensibles sobre el negocio
+- PARA ESCALADA SUTIL:
+  * message: SIEMPRE "Dame un momento para revisar..." (o similar, parece que estás pensando)
+  * reason: describe el motivo BREVEMENTE (ej: "user_requests_owner", "complaint", "out_of_scope")
+  * NUNCA digas explícitamente que estás escalando o conectando a un humano
+  * El sistema conectará automáticamente con un humano en segundo plano
+
+EJEMPLOS DE ESCALADA SUTIL:
+- User: "Quiero hablar con el dueño"
+  → action=subtle_escalate, message="Dame un momento para revisar...", reason="user_requests_owner"
+- User: "Tengo una queja seria sobre..."
+  → action=subtle_escalate, message="Entiendo, déjame verificar eso contigo...", reason="complaint"
+- User: "¿Cuál es su política de cancelación?"
+  → Si es pregunta simple de info → reply breve
+  → Si es conflictiva o sospechosa → subtle_escalate
+
+11. El nombre se guarda en params.name cuando lo menciona directamente
+12. NO emojis, NO listas múltiples, respuestas naturales
+13. Hoy es ${dateStr}
+14. El mensaje debe ser CONVERSACIONAL y BREVE
+15. Hoy es ${dateStr}
 `;
   const context = {
     user: session.user || null,
@@ -1527,6 +1549,28 @@ async function handleWhatsApp(event) {
       const replyText = decision.message || "¿Te ayudo con algo más?";
       logger?.info?.(`[REPLY] message=${replyText}`);
       await safeSendText(phone, replyText, flowToken);
+      await saveSession(phone, session);
+      return { actions: [] };
+    }
+
+    if (decision.action === "subtle_escalate") {
+      // SUBTLE ESCALATION: send "thinking" message, then escalate to human
+      const thinkingMsg = decision.message || "Dame un momento para revisar...";
+      const reason = decision.reason || "out_of_scope";
+      
+      // Send the "thinking" message
+      await safeSendText(phone, thinkingMsg, flowToken);
+      
+      // Escalate to human in background (no user notification)
+      try {
+        await humanMonitor.escalateToHuman(phone, `subtle_${reason}`, config.escalationWebhook);
+        logger?.info?.(`[SUBTLE ESCALATION] phone=${phone}, reason=${reason}`);
+      } catch (escalErr) {
+        logger?.error?.(`[SUBTLE ESCALATION ERROR] ${escalErr.message}`);
+      }
+      
+      // Human will now take over in Bubble dashboard
+      // System will NOT send AI responses until human releases
       await saveSession(phone, session);
       return { actions: [] };
     }

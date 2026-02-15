@@ -7,6 +7,8 @@ This repository implements a production-grade, multi-channel booking agent that 
 **1. Project Overview**
 
 - Multi-channel agent that: answers WhatsApp messages, answers phone calls (Twilio Voice), speaks naturally on calls, holds context, asks clarifying questions, checks real availability via Bubble, creates bookings, and escalates to humans when needed.
+- **Human monitoring system**: Real staff can view conversations in real-time, take over from AI, respond to users, and handle edge cases.
+- **Subtle escalation**: When AI encounters out-of-scope questions (owner requests, complaints), it sends a "thinking" message and hands off to a human seamlessly.
 - This is an agent (not an IVR or scripted chatbot).
 
 ---
@@ -20,7 +22,8 @@ This repository implements a production-grade, multi-channel booking agent that 
 5. Voice agent must feel human (interruptible, conversational).
 6. Same brain for WhatsApp and Voice.
 7. No hardcoded scripts or button-only logic.
-8. Escalation to human must always be possible.
+8. **Escalation to human must always be possible** (subtle or explicit).
+9. **When in doubt, hand off to human** (provide best customer experience).
 
 ---
 
@@ -28,27 +31,37 @@ This repository implements a production-grade, multi-channel booking agent that 
 
 - WhatsApp: chat-based booking, rescheduling, confirmations. Implemented as a webhook bot; needs refactor to use the shared agent core.
 - Voice (Twilio): inbound calls answered by the agent using Twilio Media Streams; audio streamed via WebSocket; NOT IVR.
+- **Human Dashboard (Bubble)**: Real-time staff interface to monitor, intervene, and manage conversations.
 
 ---
 
 **4. High-Level Architecture**
 
+```
 User (WhatsApp / Phone Call)
-→ Twilio / WhatsApp Webhook
-→ Channel Adapter (WhatsApp / Voice)
-→ AGENT CORE (shared logic)
-→ Bubble API (availability, booking)
-→ Response rendered back to channel
+    ↓
+Channel Adapter (WhatsApp / Voice)
+    ↓
+AGENT CORE (shared logic)
+    ├─→ Normal booking flow (routine questions)
+    ├─→ Subtle escalation (out-of-scope + "thinking" message)
+    └─→ Explicit escalation (high-attention situations)
+    ↓
+[Redis Session Storage]
+    ↓
+[Human Monitoring System]
+    ├─→ Check: Is human mode active?
+    ├─→ If YES → Skip AI, wait for human response
+    ├─→ If NO → Proceed with AI logic
+    ↓
+Bubble API (availability, booking, webhooks)
+    ↓
+Response rendered back to channel
+    ↓
+[Conversation Archive] → Bubble database
+```
 
-Twilio and WhatsApp are transport layers only — all intelligence lives in the Agent Core.
-
----
-
-**5. Agent Definition**
-
-- Tool-using conversational agent.
-- Can understand intent (book / cancel / reschedule / info), extract entities (sport/service, date, time preference, duration), ask follow-ups, call Bubble, confirm actions, speak or text naturally.
-- Not a decision tree, not button-only, not IVR.
+The agent can be interrupted at any time by a human taking control from the Bubble dashboard.
 
 ---
 
@@ -163,19 +176,61 @@ Current problem: logic is too WhatsApp-centric and must be refactored to a true 
 
 ---
 
-**16. Definition of Done**
+**16. Key Features (Implemented) ✅**
 
-- A user can call, talk naturally, book a service, get confirmation, receive WhatsApp summary, and escalate to human when needed — and the experience feels like a real person answered.
+### Human Monitoring System
+Real staff dashboard in Bubble to:
+- View active conversations in real-time
+- Take over from AI with one click  
+- Send messages as human staff directly to WhatsApp
+- See full conversation history with readable timestamps
+- Archive completed conversations to database
+- View escalation queue for urgent issues
+
+📖 See: [HUMAN_MONITOR_SETUP.md](HUMAN_MONITOR_SETUP.md)
+
+### Subtle Escalation (Smart Out-of-Scope Handling)
+When user asks about topics outside agent's scope:
+- Agent detects keywords (owner, complaint, policy questions)
+- Sends natural "thinking" message: "Dame un momento para revisar..."
+- Escalates to human in background (user never knows)
+- Human takes over and responds naturally in seconds
+- Experience feels seamless from user's perspective
+
+Use cases: Owner requests, complaints, policy questions, arbitrary topics
+
+📖 See: [SUBTLE_ESCALATION.md](SUBTLE_ESCALATION.md)
+
+### REST API for Integration  
+- `GET /api/conversations` - List active conversations
+- `GET /api/conversation/:phone` - Get full conversation history
+- `POST /api/conversation/:phone/takeover` - Staff takes over
+- `POST /api/conversation/:phone/release` - Release back to AI
+- `POST /api/conversation/:phone/send` - Send message as staff
+- `GET /api/escalations` - Get escalation queue
+- `POST /api/conversation/:phone/archive` - Archive conversation
+
+📖 See: [HUMAN_MONITOR_SETUP.md#rest-api-endpoints](HUMAN_MONITOR_SETUP.md#rest-api-endpoints)
 
 ---
 
-**17. Important Notes for Contributors & AI Assistants**
+**17. Definition of Done**
+
+- A user can call, talk naturally, book a service, get confirmation, receive WhatsApp summary, and escalate to human when needed — and the experience feels like a real person answered.
+- Staff can monitor active conversations and take over from AI instantly
+- Out-of-scope questions are handled gracefully via subtle escalation
+- Full audit trail of all conversations (archived in Bubble)
+
+---
+
+**18. Important Notes for Contributors & AI Assistants**
 
 - Do NOT propose IVR or button-only flows.
 - Do NOT hardcode scripts.
 - Do NOT invent availability.
 - ALWAYS respect Bubble as source of truth.
 - ALWAYS design for multi-channel reuse.
+- **Escalate early, not late** - When in doubt, hand off to human for best customer experience.
 
 ---
 
