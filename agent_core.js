@@ -1,5 +1,6 @@
 import axios from "axios";
 import { randomUUID } from "crypto";
+import * as humanMonitor from "./human_monitor.js";
 
 let deps = {};
 let openai;
@@ -7,6 +8,7 @@ let redis;
 let senders;
 let logger;
 let config;
+let monitorInitialized = false;
 
 const BUBBLE_REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const WEEKDAY_INDEX = {
@@ -94,8 +96,17 @@ export function init(dependencies = {}) {
     maxButtons: Number(deps.config?.maxButtons || 3),
     mexicoTz: deps.config?.mexicoTz || "America/Mexico_City",
     useAgent: deps.config?.useAgent !== undefined ? Boolean(deps.config.useAgent) : true,
-    staffPhone: deps.config?.staffPhone
+    staffPhone: deps.config?.staffPhone,
+    bubbleArchiveUrl: deps.config?.bubbleArchiveUrl,
+    escalationWebhook: deps.config?.escalationWebhook
   };
+  
+  // Initialize human monitoring system
+  if (!monitorInitialized && redis) {
+    humanMonitor.init({ redis, config, logger });
+    monitorInitialized = true;
+  }
+  
   return { handleIncoming };
 }
 
@@ -525,6 +536,11 @@ async function escalateToHuman(phone, reason, session = {}) {
     reason,
     sessionSummary: { date: session.date, sport: session.sport, desiredTime: session.desiredTime }
   });
+  
+  // Use human monitoring system to escalate
+  await humanMonitor.escalateToHuman(phone, reason, config.escalationWebhook);
+  
+  // Still notify staff phone if configured (legacy support)
   const staff = config.staffPhone || process.env.STAFF_PHONE;
   if (staff) {
     try {
@@ -558,6 +574,24 @@ const saveSession = (phone, session) =>
   redis?.set ? redis.set(`session:${phone}`, session, { ex: 1800 }) : Promise.resolve();
 const clearSession = phone => (redis?.del ? redis.del(`session:${phone}`) : Promise.resolve());
 
+/**
+ * Clear session and optionally archive conversation to Bubble
+ * @param {string} phone - User's phone number
+ * @param {object} metadata - Metadata about completed conversation (userName, bookingDetails, etc.)
+ * @param {boolean} shouldArchive - Whether to archive this conversation
+ */
+async function clearSessionWithArchive(phone, metadata = {}, shouldArchive = false) {
+  if (shouldArchive && config.bubbleArchiveUrl) {
+    try {
+      await humanMonitor.archiveConversation(phone, metadata);
+      logger?.info?.(`[Archive] Conversation archived for ${phone}`);
+    } catch (err) {
+      logger?.error?.(`[Archive] Failed to archive conversation for ${phone}:`, err.message);
+    }
+  }
+  await clearSession(phone);
+}
+
 const markMessageProcessed = async id => {
   if (!redis?.set) return true;
   const res = await redis.set(`msg:${id}`, 1, { nx: true, ex: 86400 });
@@ -587,6 +621,14 @@ async function safeSendText(to, text, flowToken) {
     if (!senders?.text) throw new Error("text sender not configured");
     await senders.text(to, text);
     await logEvent("send_text", { to, text });
+    
+    // Log AI message in conversation history
+    await humanMonitor.logMessage(to, {
+      sender: "ai",
+      text,
+      metadata: { type: "text" }
+    });
+    
     return { ok: true };
   } catch (err) {
     logger?.error?.("sendText failed", err?.response?.data || err?.message || err);
@@ -627,6 +669,14 @@ async function safeSendLocation(to, latitude, longitude, name, address, flowToke
     }
     await senders.location(to, { latitude, longitude, name, address });
     await logEvent("send_location", { to, name, address });
+    
+    // Log AI message in conversation history
+    await humanMonitor.logMessage(to, {
+      sender: "ai",
+      text: `📍 ${name}\n${address}`,
+      metadata: { type: "location", latitude, longitude }
+    });
+    
     return { ok: true };
   } catch (err) {
     logger?.error?.("sendLocation failed", err?.response?.data || err?.message || err);
@@ -652,6 +702,15 @@ async function safeSendList(to, bodyText, buttonText, sections, flowToken) {
     logger?.info?.(`[LIST] Sending list with ${sections[0]?.rows?.length || 0} options to ${to}`);
     await senders.list(to, bodyText, buttonText, sections);
     await logEvent("send_list", { to, bodyText, sectionsCount: sections.length });
+    
+    // Log AI message in conversation history
+    const options = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
+    await humanMonitor.logMessage(to, {
+      sender: "ai",
+      text: `${bodyText}\n\nOpciones: ${options}`,
+      metadata: { type: "list", sectionsCount: sections.length }
+    });
+    
     return { ok: true };
   } catch (err) {
     logger?.error?.(`[LIST] sendList failed: ${err?.message}`, err?.response?.data || err);
@@ -985,6 +1044,26 @@ async function handleWhatsApp(event) {
   const cleanText = normalizeText(text);
   const msgTs = Number(msg.timestamp || event.ts || 0);
 
+  // Log user message in conversation history
+  if (text) {
+    await humanMonitor.logMessage(phone, {
+      sender: "user",
+      text,
+      metadata: { 
+        type: msg.interactive?.list_reply ? "list_reply" : 
+              msg.interactive?.button_reply ? "button_reply" : "text",
+        timestamp: msgTs
+      }
+    });
+  }
+
+  // Check if conversation is in human mode (staff takeover)
+  const inHumanMode = await humanMonitor.isHumanMode(phone);
+  if (inHumanMode) {
+    logger?.info?.(`[HumanMode] Skipping AI processing for ${phone} - human is handling`);
+    return { actions: [] };
+  }
+
   const flowToken = await ensureFlowToken(phone);
 
   let session = await getSession(phone);
@@ -1060,7 +1139,16 @@ async function handleWhatsApp(event) {
           session.user?.found ? "usuario" : "invitado"
         );
         await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
-        await clearSession(phone);
+        
+        // Archive conversation after successful booking
+        await clearSessionWithArchive(phone, {
+          userName: session.user?.name || "Cliente",
+          userLastName: session.userLastName || "",
+          sport: draft.sport,
+          date: draft.date,
+          time: draft.times,
+          bookingStatus: "confirmed"
+        }, true);
       } catch (err) {
         const slots = await getAvailableHours(draft.date, draft.sport);
         session.slots = slots;
@@ -1141,7 +1229,16 @@ async function handleWhatsApp(event) {
           session.user?.found ? "usuario" : "invitado"
         );
         await safeSendText(phone, "¡Listo! Te llegará la confirmación por WhatsApp.", flowToken);
-        await clearSession(phone);
+        
+        // Archive conversation after successful booking
+        await clearSessionWithArchive(phone, {
+          userName: confirm.name,
+          userLastName: confirm.lastName || "",
+          sport: session.sport,
+          date: confirm.date,
+          time: confirm.times,
+          bookingStatus: "confirmed"
+        }, true);
       } catch (err) {
         logger?.error?.(`[BOOKING ERROR] ${err?.message}`);
         const slots = await getAvailableHours(confirm.date, session.sport);

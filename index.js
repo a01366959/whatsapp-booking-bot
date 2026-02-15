@@ -8,6 +8,7 @@ import { Redis } from "@upstash/redis";
 import { randomUUID } from "crypto";
 import { init as initAgentCore } from "./agent_core.js";
 import { createWhatsAppAdapter } from "./adapters/whatsapp.js";
+import * as humanMonitor from "./human_monitor.js";
 
 const app = express();
 app.use(express.json());
@@ -1484,8 +1485,170 @@ app.post("/webhook", async (req, res) => {
 });
 
 /******************************************************************
+ * HUMAN MONITORING API ENDPOINTS
+ ******************************************************************/
+
+// Initialize human monitoring system
+humanMonitor.init({ 
+  redis, 
+  config: {
+    bubbleArchiveUrl: process.env.BUBBLE_ARCHIVE_URL,
+    bubbleToken: process.env.BUBBLE_TOKEN
+  },
+  logger: console 
+});
+
+// GET /api/conversations - List all active conversations
+app.get("/api/conversations", async (req, res) => {
+  try {
+    const conversations = await humanMonitor.getActiveConversations();
+    res.json({ success: true, conversations });
+  } catch (err) {
+    console.error("[API] Failed to get conversations:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/conversation/:phone - Get specific conversation history
+app.get("/api/conversation/:phone", async (req, res) => {
+  try {
+    const phone = req.params.phone.replace(/\D/g, "").slice(-10);
+    const limit = parseInt(req.query.limit) || 50;
+    
+    const messages = await humanMonitor.getConversation(phone, limit);
+    const isHuman = await humanMonitor.isHumanMode(phone);
+    
+    res.json({ 
+      success: true, 
+      phone,
+      mode: isHuman ? "human" : "ai",
+      messageCount: messages.length,
+      messages 
+    });
+  } catch (err) {
+    console.error("[API] Failed to get conversation:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversation/:phone/takeover - Human takes over conversation
+app.post("/api/conversation/:phone/takeover", async (req, res) => {
+  try {
+    const phone = req.params.phone.replace(/\D/g, "").slice(-10);
+    const staffName = req.body.staffName || "staff";
+    
+    await humanMonitor.enableHumanMode(phone, staffName);
+    await humanMonitor.clearEscalation(phone);
+    
+    res.json({ 
+      success: true, 
+      message: `Conversation taken over by ${staffName}`,
+      phone,
+      mode: "human"
+    });
+  } catch (err) {
+    console.error("[API] Failed to takeover conversation:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversation/:phone/release - Release conversation back to AI
+app.post("/api/conversation/:phone/release", async (req, res) => {
+  try {
+    const phone = req.params.phone.replace(/\D/g, "").slice(-10);
+    
+    await humanMonitor.disableHumanMode(phone);
+    
+    res.json({ 
+      success: true, 
+      message: "Conversation released to AI",
+      phone,
+      mode: "ai"
+    });
+  } catch (err) {
+    console.error("[API] Failed to release conversation:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversation/:phone/send - Send message as human
+app.post("/api/conversation/:phone/send", async (req, res) => {
+  try {
+    const phone = req.params.phone.replace(/\D/g, "").slice(-10);
+    const { text, staffName = "staff" } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ success: false, error: "Text is required" });
+    }
+    
+    // Send via WhatsApp
+    await humanMonitor.sendHumanMessage(phone, text, staffName, async (p, msg) => {
+      await axios.post(
+        WHATSAPP_API,
+        {
+          messaging_product: "whatsapp",
+          to: `521${p}`,
+          type: "text",
+          text: { body: msg }
+        },
+        { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } }
+      );
+    });
+    
+    res.json({ 
+      success: true, 
+      message: "Message sent",
+      phone,
+      text
+    });
+  } catch (err) {
+    console.error("[API] Failed to send message:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/escalations - Get escalation queue
+app.get("/api/escalations", async (req, res) => {
+  try {
+    const queue = await humanMonitor.getEscalationQueue();
+    res.json({ success: true, escalations: queue });
+  } catch (err) {
+    console.error("[API] Failed to get escalations:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversation/:phone/archive - Archive completed conversation
+app.post("/api/conversation/:phone/archive", async (req, res) => {
+  try {
+    const phone = req.params.phone.replace(/\D/g, "").slice(-10);
+    const metadata = req.body.metadata || {};
+    
+    const result = await humanMonitor.archiveConversation(phone, metadata);
+    
+    res.json({ 
+      success: true, 
+      message: "Conversation archived",
+      phone,
+      result
+    });
+  } catch (err) {
+    console.error("[API] Failed to archive conversation:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/******************************************************************
  * SERVER
  ******************************************************************/
 app.listen(process.env.PORT || 3000, () => {
   console.log("FULL AI AGENT RUNNING (REDIS)");
+  console.log("Human Monitor API ready:");
+  console.log("  GET  /api/conversations");
+  console.log("  GET  /api/conversation/:phone");
+  console.log("  POST /api/conversation/:phone/takeover");
+  console.log("  POST /api/conversation/:phone/release");
+  console.log("  POST /api/conversation/:phone/send");
+  console.log("  GET  /api/escalations");
+  console.log("  POST /api/conversation/:phone/archive");
 });
