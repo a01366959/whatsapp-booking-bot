@@ -76,7 +76,7 @@ const TOOLS = [
         properties: {
           sport: { 
             type: "string", 
-            enum: ["Padel", "Pickleball"],
+            enum: SPORTS.map(s => s.name),
             description: "Sport type" 
           },
           date: { 
@@ -207,6 +207,54 @@ async function bubbleRequest(method, path, { params, data } = {}) {
   throw lastErr;
 }
 
+// ===== SPORTS CONFIGURATION =====
+// Edit this to add/remove sports. Each sport has:
+// - name: Display name in messages
+// - keywords: Array of words user might say
+// - api_name: Name to send to get_hours endpoint
+// - default: true to suggest if user doesn't pick
+// ================================
+const SPORTS = [
+  {
+    name: "Padel",
+    keywords: ["padel", "paddle"],
+    api_name: "Padel",
+    default: true
+  },
+  {
+    name: "Pickleball",
+    keywords: ["pickleball", "pickle"],
+    api_name: "Pickleball",
+    default: false
+  },
+  {
+    name: "Golf",
+    keywords: ["golf", "simulador"],
+    api_name: "Golf",
+    default: false
+  }
+];
+
+// Helper: Get available sports (non-deleted ones)
+const getAvailableSports = () => SPORTS.filter(s => !s.deleted);
+
+// Helper: Get default sport (first one marked default:true)
+const getDefaultSport = () => {
+  const def = SPORTS.find(s => s.default && !s.deleted);
+  return def ? def.name : SPORTS[0]?.name;
+};
+
+// Helper: Parse user input and match to a sport
+const parseSport = (userText) => {
+  const t = (userText || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  for (const sport of getAvailableSports()) {
+    for (const keyword of sport.keywords) {
+      if (t.includes(keyword)) return sport.name;
+    }
+  }
+  return null;
+};
+
 const CLUB_INFO = {
   name: "Black Padel & Pickleball",
   address: "P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México, CP 52147",
@@ -232,6 +280,10 @@ const SYSTEM_MESSAGE = {
   role: "system",
   content: `
 Eres Michelle, recepcionista amable y cálida de Black Padel & Pickleball (México).
+
+DEPORTES DISPONIBLES:
+${getAvailableSports().map(s => `- ${s.name}`).join("\n")}
+DEPORTE POR DEFECTO (si el usuario no especifica): ${getDefaultSport()}
 
 INFORMACIÓN DEL CLUB:
 - Nombre: ${CLUB_INFO.name}
@@ -1022,9 +1074,21 @@ RULE 5: CONVERSATION PROGRESSION (Never loop):
 After you show available times and ask user to pick:
 → User says "15:00" or picks any time → bookingDraft.time is LOCKED
 → User confirms ("sí", "dale", "15:00 está bien") → time choice is FINAL
-→ NEVER ask about time again. Move to NEXT step: ask for name
-→ If user says "yes" and you already have sport+date+time → DON'T re-confirm time
-→ Just ask for the NEXT missing field (name, or call confirm_booking if name exists)RULE 5: CONFIRMATION FLOW:
+→ NEVER ask about time again. Move to NEXT step.
+
+RULE 5B: AFTER TIME IS LOCKED (Progressive questioning):
+If bookingDraft.time is set but bookingDraft.name is null:
+→ NEXT response should ask for name: "¿A qué nombre?"
+→ DON'T re-confirm time, DON'T show times again
+→ ONLY ask for what's missing
+
+If user responds with "sí por favor" or similar confirms when time+sport+date exist but name is null:
+→ User is confirming their willingness, not confirming specific time
+→ Extract name from response if present
+→ If no name in response, ask: "¿A qué nombre?"
+→ Then call confirm_booking (or use name from get_user if available)
+
+RULE 5C: CONFIRMATION FLOW:
 When bookingDraft is COMPLETE (sport + date + time + name):
 → Send confirmation message (examples below)
 → IMMEDIATELY call confirm_booking
