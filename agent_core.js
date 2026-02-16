@@ -899,19 +899,14 @@ async function agentDecide(phone, userText, session) {
   
   const { dateStr } = getMexicoDateParts();
   
-  // Build context from current session
+  // Build context from current session using NEW structure
   const sessionContext = {
+    bookingDraft: session?.bookingDraft || {},
     user_name: session?.user?.name || null,
     last_name: session?.userLastName || null,
-    sport: session?.sport || null,
-    date: session?.date || null,
-    desired_time: session?.desiredTime || null,
     available_times: session?.hours || [],
-    duration_hours: session?.duration || 1
+    conversation_history: session?.messages || []
   };
-  
-  // Get conversation history from Redis for context awareness
-  const conversationHistory = await getConversationHistory(phone, 10);
   
   const systemPrompt = `Eres Michelle, recepcionista humana de Black Padel & Pickleball. Tu trabajo es hacer reservas de manera natural, como lo haría una persona real.
 
@@ -1208,9 +1203,11 @@ Bot: [LLAMA confirm_booking] ← Ya terminó, no pide nada más
 
 SÉ NATURAL, HONESTO, Y RECUERDA TODO.`;
 
+  // Build messages array with full conversation history from session
   const messages = [
     { role: "system", content: systemPrompt },
-    ...conversationHistory,  // Include full conversation history
+    // Include all session messages (accumulated conversation)
+    ...(session?.messages || []).filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls)),
     { role: "user", content: userText }
   ];
 
@@ -1342,6 +1339,11 @@ async function handleWhatsApp(event) {
   const decision = await agentDecide(phone, text, session);
   logger?.info?.(`[AGENT] Response excerpt: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}`);
 
+  // Save assistant response to conversation history for next turns
+  if (decision.response) {
+    session.messages.push({ role: "assistant", content: decision.response });
+  }
+
   // Handle escalation immediately
   if (decision.needsEscalation) {
     await safeSendText(phone, decision.response || "Dame un momento para revisar...", flowToken);
@@ -1383,8 +1385,8 @@ async function handleWhatsApp(event) {
       }
 
       else if (toolName === "get_hours") {
-        const sport = args.sport || session.sport;
-          const date = args.date || session.date;
+        const sport = args.sport || session.bookingDraft.sport;
+        const date = args.date || session.bookingDraft.date;
 
           if (!sport || !date) {
             toolResults.push({ toolName, result: "Missing sport or date for availability check" });
@@ -1413,8 +1415,8 @@ async function handleWhatsApp(event) {
         }
 
         else if (toolName === "confirm_booking") {
-          const bookingSport = args.sport || session.sport;
-          const bookingDate = args.date || session.date;
+          const bookingSport = args.sport || session.bookingDraft.sport;
+          const bookingDate = args.date || session.bookingDraft.date;
           const bookingTime = args.time;
           const bookingName = args.name;
           const bookingLastName = args.last_name || "";
@@ -1486,7 +1488,7 @@ async function handleWhatsApp(event) {
           .join("\n");
 
         logger?.info?.(`[AGENTIC] Feeding results back to AI:\n${resultsText}`);
-        logger?.info?.(`[AGENTIC] Session state: sport=${session.sport}, date=${session.date}, hours=[${session.hours?.join(", ")}], user=${session.user?.name}`);
+        logger?.info?.(`[AGENTIC] Session state: sport=${session.bookingDraft.sport}, date=${session.bookingDraft.date}, hours=[${session.hours?.join(", ")}], user=${session.user?.name}`);
 
         const followUpDecision = await agentDecide(
           phone,
@@ -1511,8 +1513,8 @@ async function handleWhatsApp(event) {
             }
 
             if (toolName === "confirm_booking" && followUpArgs.time && followUpArgs.name) {
-              const sport = followUpArgs.sport || session.sport;
-              const date = followUpArgs.date || session.date;
+              const sport = followUpArgs.sport || session.bookingDraft.sport;
+              const date = followUpArgs.date || session.bookingDraft.date;
               const time = followUpArgs.time;
               const name = followUpArgs.name;
               const lastName = followUpArgs.last_name || "";
