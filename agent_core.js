@@ -1397,43 +1397,16 @@ async function handleWhatsApp(event) {
       session.userChecked = true;
     }
 
-    // Extract and remember data from this message BEFORE calling AI
-    // This ensures session context is up-to-date
-    const extractedSport = extractSport(text);
-    if (extractedSport) {
-      session.sport = extractedSport;
-      logger?.info?.(`[EXTRACT] Sport from text: ${extractedSport}`);
-    }
-
-    const extractedDate = resolveDate(text);
-    if (extractedDate) {
-      session.date = extractedDate;
-      logger?.info?.(`[EXTRACT] Date from text: ${extractedDate}`);
-    }
-
-    const extractedTime = extractTime(text);
-    if (extractedTime) {
-      session.desiredTime = extractedTime;
-      logger?.info?.(`[EXTRACT] Time from text: ${extractedTime}`);
-    }
-
-    const extractedDuration = extractDuration(text);
-    if (extractedDuration) {
-      session.duration = extractedDuration;
-      logger?.info?.(`[EXTRACT] Duration from text: ${extractedDuration}`);
-    }
-
-    // Call agent with new tool-based architecture  
+    // Call agent with tool-based architecture - let AI handle all decision making
     const decision = await agentDecide(phone, text, session);
-    logger?.info?.(`[AGENT] Response: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}, Escalation: ${decision.needsEscalation}`);
-    logger?.info?.(`[SESSION] Sport: ${session.sport}, Date: ${session.date}, Time: ${session.desiredTime}`);
+    logger?.info?.(`[AGENT] Response excerpt: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}`);
 
     // Handle escalation immediately
     if (decision.needsEscalation) {
       await safeSendText(phone, decision.response || "Dame un momento para revisar...", flowToken);
       try {
         await humanMonitor.escalateToHuman(phone, "subtle_escalation", config.escalationWebhook);
-        logger?.info?.(`[SUBTLE ESCALATION] phone=${phone}`);
+        logger?.info?.(`[SUBTLE ESCALATION] Escalated: ${phone}`);
       } catch (escalErr) {
         logger?.error?.(`[SUBTLE ESCALATION ERROR] ${escalErr.message}`);
       }
@@ -1441,242 +1414,201 @@ async function handleWhatsApp(event) {
       return { actions: [] };
     }
 
-    // Process tool calls
+    // Process tool calls - simplified execution with agentic loop
     if (decision.toolCalls && decision.toolCalls.length > 0) {
+      const toolResults = [];
+      
       for (const toolCall of decision.toolCalls) {
         const toolName = toolCall.function.name;
         let args;
         try {
           args = JSON.parse(toolCall.function.arguments);
         } catch (parseErr) {
-          logger?.error?.(`[TOOL] Failed to parse arguments for ${toolName}:`, parseErr.message);
+          logger?.error?.(`[TOOL] Parse error for ${toolName}: ${parseErr.message}`);
           continue;
         }
 
-        logger?.info?.(`[TOOL] Executing ${toolName} with args:`, JSON.stringify(args));
+        logger?.info?.(`[TOOL] Executing: ${toolName}`);
 
         if (toolName === "get_user") {
-          // Fetch user information
           const userInfo = await findUser(args.phone || phone);
           session.user = userInfo;
           if (userInfo?.last_name) session.userLastName = userInfo.last_name;
-          logger?.info?.(`[TOOL] get_user result: ${userInfo?.name || 'not found'}`);
+          logger?.info?.(`[TOOL] get_user: ${userInfo?.name || 'not found'}`);
+          toolResults.push({
+            toolName,
+            result: userInfo ? `User found: ${userInfo.name}` : "User not found"
+          });
         }
 
         else if (toolName === "get_hours") {
-          // Get available hours and update session
-          const sport = args.sport || session.sport || config.defaultSport;
+          const sport = args.sport || session.sport;
           const date = args.date || session.date;
 
-          logger?.info?.(`[TOOL] get_hours - Sport: ${sport} (from args: ${args.sport}, session: ${session.sport})`);
-          logger?.info?.(`[TOOL] get_hours - Date: ${date} (from args: ${args.date}, session: ${session.date})`);
-
-          if (!date) {
-            await safeSendText(phone, "¿Para qué fecha quieres reservar?", flowToken);
-            await saveSession(phone, session);
-            return { actions: [] };
+          if (!sport || !date) {
+            toolResults.push({ toolName, result: "Missing sport or date for availability check" });
+            continue;
           }
 
-          if (!sport) {
-            await safeSendText(phone, "¿Para qué deporte? Tengo Padel y Pickleball.", flowToken);
-            await saveSession(phone, session);
-            return { actions: [] };
+          try {
+            const slots = await getAvailableHours(date, sport);
+            const options = buildOptions(slots, 1);
+            const timesList = startTimesFromOptions(options);
+
+            session.slots = slots;
+            session.options = options;
+            session.sport = sport;
+            session.date = date;
+
+            const result = timesList.length > 0 
+              ? `Available times for ${sport} on ${formatDateEs(date)}: ${timesList.join(", ")}`
+              : `No availability for ${sport} on ${formatDateEs(date)}`;
+
+            toolResults.push({ toolName, result });
+          } catch (err) {
+            toolResults.push({ toolName, result: `Error fetching times: ${err.message}` });
           }
-
-          session.sport = sport;
-          session.date = date;
-
-          const slots = await getAvailableHours(date, sport);
-          session.slots = slots;
-          session.options = buildOptions(slots, session.duration || 1);
-          session.hours = startTimesFromOptions(session.options);
-
-          // FILTER by time-of-day preference (mañana/tarde) if user mentioned it
-          let filteredOptions = session.options;
-          const prefersTarde = /\b(tarde|en\s+la\s+tarde|por\s+la\s+tarde)\b/i.test(text);
-          const prefersMañana = /\b(mañana|en\s+la\s+mañana|por\s+la\s+mañana|temprano)\b/i.test(text);
-          
-          if (prefersTarde) {
-            filteredOptions = session.options.filter(o => {
-              const hour = parseInt(o.start.split(':')[0]);
-              return hour >= 14; // afternoon = 14:00 onwards
-            });
-            logger?.info?.(`[TOOL] get_hours - Filtering for TARDE, reduced from ${session.options.length} to ${filteredOptions.length}`);
-          } else if (prefersMañana) {
-            filteredOptions = session.options.filter(o => {
-              const hour = parseInt(o.start.split(':')[0]);
-              return hour < 14; // morning = before 14:00
-            });
-            logger?.info?.(`[TOOL] get_hours - Filtering for MAÑANA, reduced from ${session.options.length} to ${filteredOptions.length}`);
-          }
-          
-          session.filteredOptions = filteredOptions;
-          session.hours = startTimesFromOptions(filteredOptions);
-
-          logger?.info?.(`[TOOL] get_hours - Found ${filteredOptions?.length || 0} options for ${sport} on ${date} (after filtering)`);
-
-          if (!filteredOptions?.length) {
-            const noTimesMsg = prefersTarde ? "No tengo horarios en la tarde" : 
-                               prefersMañana ? "No tengo horarios en la mañana" : 
-                               `No tengo horarios disponibles para ${formatDateEs(date)}`;
-            await safeSendText(phone, `${noTimesMsg}. ¿Quieres revisar otra fecha o cambiar la hora?`, flowToken);
-            session.date = null;
-            await saveSession(phone, session);
-            return { actions: [] };
-          }
-
-          // Extract time from user text if they mentioned one
-          const timeExtracted = extractTime(text);
-          if (timeExtracted.time) {
-            session.desiredTime = timeExtracted.time;
-            
-            // If time is ambiguous (bare number), ask for clarification
-            if (timeExtracted.isAmbiguous) {
-              const hour = parseInt(timeExtracted.time.split(':')[0]);
-              await safeSendText(phone, `¿A las ${hour} de la mañana o de la noche?`, flowToken);
-              await saveSession(phone, session);
-              return { actions: [] };
-            }
-          }
-
-          // If user specified a time, check if it's available
-          if (session.desiredTime) {
-            const match = filteredOptions.find(o => o.start === session.desiredTime);
-            if (match) {
-              // Time is available, prepare confirmation
-              const name = session.user?.name || "";
-              const lastName = session.userLastName || "";
-              
-              if (!name && !session.user?.found) {
-                session.awaitingName = true;
-                session.pendingConfirmDraft = {
-                  date: session.date,
-                  times: match.times,
-                  court: match.court,
-                  sport: session.sport
-                };
-                await safeSendText(phone, "¿A nombre de quién hago la reserva? (Nombre y apellido)", flowToken);
-                await saveSession(phone, session);
-                return { actions: [] };
-              }
-
-              const reservationName = name || "Cliente";
-              const dateFormatted = formatDateEs(session.date);
-              const timeFormatted = formatTimeRange(match.times);
-              
-              // Add clarification for ambiguous times (10 → 10 de la mañana, 22 → 10 de la noche)
-              const hour = parseInt(match.times[0].split(':')[0]);
-              const timeClarity = hour < 12 ? "de la mañana" : hour < 19 ? "de la tarde" : "de la noche";
-              
-              const summaryMsg = `Perfecto, ${reservationName}. Entonces confirmamos: ${session.sport} el ${dateFormatted} a las ${match.times[0]} ${timeClarity}. ¿Te parece bien?`;
-              
-              session.pendingConfirm = {
-                date: session.date,
-                times: match.times,
-                court: match.court,
-                name: reservationName,
-                lastName: lastName
-              };
-
-              await safeSendText(phone, summaryMsg, flowToken);
-              await saveSession(phone, session);
-              return { actions: [] };
-            } else {
-              // Desired time not available, show closest options from filtered list
-              const suggestions = pickClosestOptions(filteredOptions, session.desiredTime);
-              const timeList = suggestions.map(o => o.start).join(", ");
-              await safeSendText(phone, `No tengo ${session.desiredTime}. Tengo ${timeList}. ¿Te funciona alguno?`, flowToken);
-              await saveSession(phone, session);
-              return { actions: [] };
-            }
-          }
-
-          // No specific time requested, show all available times
-          const allStarts = startTimesFromOptions(session.options);
-          const bodyText = `Para ${session.sport} el ${formatDateEs(session.date)}, tengo estos horarios:`;
-          
-          const rows = allStarts.map((time, idx) => ({
-            id: `time_${idx}_${time.replace(':', '')}`,
-            title: time,
-            description: `${session.sport} - ${formatDateEs(session.date)}`
-          }));
-          
-          const sections = [{ title: "Horarios disponibles", rows }];
-          await safeSendList(phone, bodyText, "Ver horarios", sections, flowToken);
-          await saveSession(phone, session);
-          return { actions: [] };
         }
 
         else if (toolName === "confirm_booking") {
-          // Confirm booking with provided details
           const bookingSport = args.sport || session.sport;
           const bookingDate = args.date || session.date;
           const bookingTime = args.time;
-          const bookingName = args.name || session.user?.name;
-          const bookingLastName = args.last_name || session.userLastName || "";
-          const bookingDuration = args.duration_hours || session.duration || 1;
+          const bookingName = args.name;
+          const bookingLastName = args.last_name || "";
 
-          if (!bookingDate || !bookingTime || !bookingSport) {
-            await safeSendText(phone, "Necesito fecha, hora y deporte para confirmar la reserva.", flowToken);
-            await saveSession(phone, session);
-            return { actions: [] };
+          if (!bookingSport || !bookingDate || !bookingTime || !bookingName) {
+            toolResults.push({
+              toolName,
+              result: "Cannot confirm: missing sport, date, time, or name"
+            });
+            continue;
           }
 
-          // Update session
-          session.sport = bookingSport;
-          session.date = bookingDate;
-          session.desiredTime = bookingTime;
-          session.duration = bookingDuration;
+          try {
+            if (!session.options?.length) {
+              const slots = await getAvailableHours(bookingDate, bookingSport);
+              session.options = buildOptions(slots, 1);
+            }
 
-          // Get slots if not already loaded
-          if (!session.options?.length) {
-            const slots = await getAvailableHours(bookingDate, bookingSport);
-            session.slots = slots;
-            session.options = buildOptions(slots, bookingDuration);
-            session.hours = startTimesFromOptions(session.options);
-          }
+            const match = session.options.find(o => o.start === bookingTime);
+            if (!match) {
+              const suggestions = startTimesFromOptions(session.options).slice(0, 3);
+              toolResults.push({
+                toolName,
+                result: `Time ${bookingTime} unavailable. Try: ${suggestions.join(", ")}`
+              });
+              continue;
+            }
 
-          // Find matching option
-          const match = session.options.find(o => o.start === bookingTime);
-          if (!match) {
-            const suggestions = pickClosestOptions(session.options, bookingTime);
-            const timeList = suggestions.map(o => o.start).join(", ");
-            await safeSendText(phone, `No tengo ${bookingTime}. Tengo ${timeList}. ¿Te funciona alguno?`, flowToken);
-            await saveSession(phone, session);
-            return { actions: [] };
-          }
+            await confirmBooking(
+              phone,
+              bookingDate,
+              match.times,
+              match.court,
+              bookingName,
+              bookingLastName,
+              session.user?.id,
+              bookingSport,
+              session.user?.found ? "usuario" : "invitado"
+            );
 
-          // Check if we need to ask for name
-          if (!bookingName && !session.user?.found) {
-            session.awaitingName = true;
-            session.pendingConfirmDraft = {
+            logger?.info?.(`[BOOKING] Confirmed: ${bookingName} - ${bookingSport} on ${bookingDate}`);
+            toolResults.push({
+              toolName,
+              result: `Booking confirmed! ${bookingSport} on ${formatDateEs(bookingDate)} at ${bookingTime} for ${bookingName}`
+            });
+
+            await clearSessionWithArchive(phone, {
+              userName: bookingName,
+              userLastName: bookingLastName,
+              sport: bookingSport,
               date: bookingDate,
-              times: match.times,
-              court: match.court,
-              sport: bookingSport
-            };
-            await safeSendText(phone, "¿A nombre de quién hago la reserva? (Nombre y apellido)", flowToken);
-            await saveSession(phone, session);
-            return { actions: [] };
+              time: bookingTime,
+              bookingStatus: "confirmed"
+            }, true);
+          } catch (err) {
+            logger?.error?.(`[BOOKING ERROR] ${err.message}`);
+            toolResults.push({
+              toolName,
+              result: `Booking failed: ${err.message}`
+            });
           }
-
-          const reservationName = bookingName || "Cliente";
-          const dateFormatted = formatDateEs(bookingDate);
-          const timeFormatted = formatTimeRange(match.times);
-          const summaryMsg = `Perfecto, ${reservationName}. Entonces confirmamos: ${bookingSport} el ${dateFormatted} a las ${timeFormatted}. ¿Te parece bien?`;
-          
-          session.pendingConfirm = {
-            date: bookingDate,
-            times: match.times,
-            court: match.court,
-            name: reservationName,
-            lastName: bookingLastName
-          };
-
-          await safeSendText(phone, summaryMsg, flowToken);
-          await saveSession(phone, session);
-          return { actions: [] };
         }
+      }
+
+      // AGENTIC LOOP: Feed tool results back to AI
+      if (toolResults.length > 0) {
+        const resultsText = toolResults
+          .map(tr => `[${tr.toolName}]: ${tr.result}`)
+          .join("\n");
+
+        logger?.info?.(`[AGENTIC] Feeding results back to AI:\n${resultsText}`);
+
+        const followUpDecision = await agentDecide(
+          phone,
+          `Tool results:\n${resultsText}\n\nContinue the conversation naturally based on these results.`,
+          session
+        );
+
+        if (followUpDecision.response) {
+          await safeSendText(phone, followUpDecision.response, flowToken);
+        }
+
+        if (followUpDecision.toolCalls?.length > 0) {
+          logger?.info?.(`[AGENTIC] AI wants to use ${followUpDecision.toolCalls.length} more tool(s)`);
+          for (const toolCall of followUpDecision.toolCalls) {
+            const toolName = toolCall.function.name;
+            let followUpArgs;
+            try {
+              followUpArgs = JSON.parse(toolCall.function.arguments);
+            } catch (err) {
+              logger?.error?.(`[TOOL] Parse error: ${err.message}`);
+              continue;
+            }
+
+            if (toolName === "confirm_booking" && followUpArgs.time && followUpArgs.name) {
+              const sport = followUpArgs.sport || session.sport;
+              const date = followUpArgs.date || session.date;
+              const time = followUpArgs.time;
+              const name = followUpArgs.name;
+              const lastName = followUpArgs.last_name || "";
+
+              if (!session.options?.length) {
+                const slots = await getAvailableHours(date, sport);
+                session.options = buildOptions(slots, 1);
+              }
+
+              const match = session.options.find(o => o.start === time);
+              if (match) {
+                try {
+                  await confirmBooking(
+                    phone, date, match.times, match.court,
+                    name, lastName,
+                    session.user?.id, sport,
+                    session.user?.found ? "usuario" : "invitado"
+                  );
+
+                  await safeSendText(phone, `¡Listo! Te llegará la confirmación por WhatsApp.`, flowToken);
+                  await clearSessionWithArchive(phone, {
+                    userName: name,
+                    userLastName: lastName,
+                    sport,
+                    date,
+                    time,
+                    bookingStatus: "confirmed"
+                  }, true);
+                } catch (bookErr) {
+                  logger?.error?.(`[BOOKING ERROR] ${bookErr.message}`);
+                  await safeSendText(phone, `No pude confirmar. ¿Quieres intentar otra hora?`, flowToken);
+                }
+              }
+            }
+          }
+        }
+
+        await saveSession(phone, session);
+        return { actions: [] };
       }
     }
 
