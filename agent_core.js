@@ -1071,6 +1071,17 @@ Tú: ¿Para qué fecha? ❌ ← USUARIO YA DIJO "MAÑANA"
 SESIÓN ACTUAL (datos ya capturados):
 ${JSON.stringify(sessionContext, null, 2)}
 
+⚠️ HORARIOS DISPONIBLES - REGLA IMPORTANTE:
+Si ya MOSTRASTE una lista de horarios disponibles, y el usuario dice una hora:
+1. Mira la lista que YA mostraste (session.available_times)
+2. Interpreta lo que el usuario dijo usando esa lista:
+   - Usuario dice "3" + disponibles tiene "15:00" → ES 15:00
+   - Usuario dice "11" + disponibles tiene "11:00" → ES 11:00
+   - Usuario dice "tarde" → filtra horarios >= 14:00
+   - SOLO pregunta "¿mañana o tarde?" si REALMENTE hay ambigüedad después de checar la lista
+3. Presenta la hora con claridad: "Perfecto, 15:00 (3 de la tarde)"
+4. NUNCA re-muestres los horarios que ya mostraste
+
 EXTRACCIÓN DE DATOS DEL USUARIO:
 - "mañana" → fecha = día siguiente (${dateStr})
 - "Padel" o "Pickleball" → deporte
@@ -1082,7 +1093,10 @@ EXTRACCIÓN DE DATOS DEL USUARIO:
 
 CUÁNDO USAR HERRAMIENTAS:
 - **get_hours**: Cuando tengas deporte + fecha → úsala INMEDIATAMENTE, no preguntes más
-- **confirm_booking**: Solo cuando usuario confirme un horario específico ("sí", "confirmo", "ese")
+- **confirm_booking**: INMEDIATAMENTE cuando:
+  - Usuario dice "sí", "si", "confirmo", "confir", "yes", "vale", "listo", "adelante"
+  - Tengas: sport, date, time, name
+  - NO necesitas preguntar más después - solo llama el tool y el sistema responde
 
 TOOLS DISPONIBLES:
 - get_hours, confirm_booking, get_user
@@ -1097,15 +1111,36 @@ FLUJO NATURAL (como humano):
 2. Si falta deporte → pregunta
 3. Si falta fecha → pregunta  
 4. En cuanto tengas deporte + fecha → LLAMA get_hours AUTOMÁTICAMENTE
-5. Usuario elige hora → presenta confirmación CON CLARIFICACIÓN (ej: "10 de la mañana")
-6. Usuario dice "sí" → LLAMA confirm_booking
+5. Muestra horarios disponibles
+6. Usuario elige hora → pregunta confirmación CON CLARIFICACIÓN si es ambiguo
+7. Usuario dice "sí" → LLAMA confirm_booking (NO re-preg asuntos que ya confirmó)
+
+REGLA DE CONFIRMACIÓN:
+- Si usuario ya confirmó una hora específica → NO vuelvas a preguntar la hora
+- Si usuario ya dio deporte → NO vuelvas a preguntar el deporte
+- Si usuario dice "si" o "confirmo" → va directo a confirm_booking
 
 NUNCA DIGAS:
 ❌ "Voy a revisar"
 ❌ "Déjame consultar"
 ❌ "¿Para qué fecha?" (si ya dijeron la fecha)
 ❌ "¿Qué deporte?" (si ya dijeron el deporte)
+❌ "¿A qué hora?" (si ya dijeron la hora)
 ❌ "Te recomendaría que te pongas en contacto con..."
+❌ Repetir confirmaciones que ya hiciste
+
+ANTI-PATRÓN (NUNCA HAGAS ESTO):
+User: "3 de la tarde"
+Bot: "¿Quieres 15:00?"
+User: "Si"
+Bot: "¿Estás seguro de 15:00?" ← MALA, ya confirmó
+Bot: "¿A qué hora?" ← TERRIBLE, acaba de decir la hora
+
+PATRÓN CORRECTO:
+User: "3 de la tarde"
+Bot: "¿Confirmó 15:00 para hoy?"
+User: "Si"
+Bot: [LLAMA confirm_booking] ← Ya terminó, no pide nada más
 
 SÉ NATURAL, HONESTO, Y RECUERDA TODO.`;
 
@@ -1342,6 +1377,7 @@ async function handleWhatsApp(event) {
 
             session.slots = slots;
             session.options = options;
+            session.hours = timesList;  // IMPORTANT: Store hours so AI can use them
             session.sport = sport;
             session.date = date;
 
@@ -1429,6 +1465,7 @@ async function handleWhatsApp(event) {
           .join("\n");
 
         logger?.info?.(`[AGENTIC] Feeding results back to AI:\n${resultsText}`);
+        logger?.info?.(`[AGENTIC] Session state: sport=${session.sport}, date=${session.date}, hours=[${session.hours?.join(", ")}], user=${session.user?.name}`);
 
         const followUpDecision = await agentDecide(
           phone,
