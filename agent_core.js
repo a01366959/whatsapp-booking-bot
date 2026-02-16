@@ -50,6 +50,54 @@ const SPANISH_NUMBERS = {
   diez: 10
 };
 
+// ===== SPORTS CONFIGURATION =====
+// Edit this to add/remove sports. Each sport has:
+// - name: Display name in messages
+// - keywords: Array of words user might say
+// - api_name: Name to send to get_hours endpoint
+// - default: true to suggest if user doesn't pick
+// ================================
+const SPORTS = [
+  {
+    name: "Padel",
+    keywords: ["padel", "paddle"],
+    api_name: "Padel",
+    default: true
+  },
+  {
+    name: "Pickleball",
+    keywords: ["pickleball", "pickle"],
+    api_name: "Pickleball",
+    default: false
+  },
+  {
+    name: "Golf",
+    keywords: ["golf", "simulador"],
+    api_name: "Golf",
+    default: false
+  }
+];
+
+// Helper: Get available sports (non-deleted ones)
+const getAvailableSports = () => SPORTS.filter(s => !s.deleted);
+
+// Helper: Get default sport (first one marked default:true)
+const getDefaultSport = () => {
+  const def = SPORTS.find(s => s.default && !s.deleted);
+  return def ? def.name : SPORTS[0]?.name;
+};
+
+// Helper: Parse user input and match to a sport
+const parseSport = (userText) => {
+  const t = (userText || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  for (const sport of getAvailableSports()) {
+    for (const keyword of sport.keywords) {
+      if (t.includes(keyword)) return sport.name;
+    }
+  }
+  return null;
+};
+
 const TOOLS = [
   {
     type: "function",
@@ -206,54 +254,6 @@ async function bubbleRequest(method, path, { params, data } = {}) {
   }
   throw lastErr;
 }
-
-// ===== SPORTS CONFIGURATION =====
-// Edit this to add/remove sports. Each sport has:
-// - name: Display name in messages
-// - keywords: Array of words user might say
-// - api_name: Name to send to get_hours endpoint
-// - default: true to suggest if user doesn't pick
-// ================================
-const SPORTS = [
-  {
-    name: "Padel",
-    keywords: ["padel", "paddle"],
-    api_name: "Padel",
-    default: true
-  },
-  {
-    name: "Pickleball",
-    keywords: ["pickleball", "pickle"],
-    api_name: "Pickleball",
-    default: false
-  },
-  {
-    name: "Golf",
-    keywords: ["golf", "simulador"],
-    api_name: "Golf",
-    default: false
-  }
-];
-
-// Helper: Get available sports (non-deleted ones)
-const getAvailableSports = () => SPORTS.filter(s => !s.deleted);
-
-// Helper: Get default sport (first one marked default:true)
-const getDefaultSport = () => {
-  const def = SPORTS.find(s => s.default && !s.deleted);
-  return def ? def.name : SPORTS[0]?.name;
-};
-
-// Helper: Parse user input and match to a sport
-const parseSport = (userText) => {
-  const t = (userText || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  for (const sport of getAvailableSports()) {
-    for (const keyword of sport.keywords) {
-      if (t.includes(keyword)) return sport.name;
-    }
-  }
-  return null;
-};
 
 const CLUB_INFO = {
   name: "Black Padel & Pickleball",
