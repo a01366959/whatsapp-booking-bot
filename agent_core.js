@@ -614,7 +614,10 @@ const clearSession = phone => (redis?.del ? redis.del(`session:${phone}`) : Prom
 async function getConversationHistory(phone, limit = 10) {
   try {
     const conversation = await humanMonitor.getConversation(phone, limit);
-    if (!conversation || !conversation.messages) return [];
+    if (!conversation || !conversation.messages) {
+      logger?.info?.(`[ConversationHistory] No history found for ${phone}`);
+      return [];
+    }
     
     // Convert to OpenAI message format
     const messages = [];
@@ -626,6 +629,11 @@ async function getConversationHistory(phone, limit = 10) {
           content: msg.text
         });
       }
+    }
+    
+    logger?.info?.(`[ConversationHistory] Retrieved ${messages.length} messages for ${phone}`);
+    if (messages.length > 0) {
+      logger?.info?.(`[ConversationHistory] Last message: "${messages[messages.length - 1]?.content?.substring(0, 50)}..."`);
     }
     
     return messages;
@@ -1006,59 +1014,78 @@ async function agentDecide(phone, userText, session) {
   // Get conversation history from Redis for context awareness
   const conversationHistory = await getConversationHistory(phone, 10);
   
-  const systemPrompt = `Eres Michelle, recepcionista amable y cálida de Black Padel & Pickleball.
+  const systemPrompt = `Eres Michelle, recepcionista humana de Black Padel & Pickleball. Tu trabajo es hacer reservas de manera natural, como lo haría una persona real.
 
 INFORMACIÓN DEL CLUB:
 - Nombre: Black Padel & Pickleball
-- Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México, CP 52147
+- Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México
 - Horarios: Lunes a viernes 7:00-22:00, Sábado y domingo 8:00-15:00
-- Canchas: 2 Padel techadas, 2 Pickleball techadas, 1 simulador Golf
-- Estacionamiento gratuito, WiFi, Bar, Tienda, Vestidores
-- WhatsApp: +52 56 5440 7815, Instagram: @blackpadelandpickleball
-- Google Maps: https://maps.app.goo.gl/7rVpWz5benMH9fHu5
+- Deportes: Padel, Pickleball
+- WhatsApp: +52 56 5440 7815
 
-FECHAS Y CONTEXTO:
-- Hoy es ${dateStr}
-- Cuando el usuario dice "mañana", calcula la fecha correcta
-- Cuando dice "a las 3" probablemente se refiere a 15:00 (3pm), NO 03:00am
-- Si menciona solo un número en contexto de horarios (ej: "el 9", "dame el 14"), es la hora en formato 24h
+HOY ES: ${dateStr}
 
-CÓMO COMPORTARTE (MUY IMPORTANTE):
-1. **Razona sobre el contexto completo**: Lee TODA la conversación antes de responder, no solo el último mensaje
-2. **Maneja correcciones naturalmente**: Si el usuario cambia de opinión ("mejor mañana", "otra hora"), adapta sin forzar un flujo rígido
-3. **Entiende ambigüedad**: "a las 3" en contexto de reservas deportivas = 15:00, no 03:00
-4. **Sé proactivo**: Si el usuario pregunta horarios y ya tienes deporte+fecha, llama get_hours inmediatamente
-5. **No repitas información**: Si ya mostraste horarios y el usuario pregunta de nuevo, muéstralos otra vez sin quejarte
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ REGLA CRÍTICA DE MEMORIA (LEE ESTO PRIMERO) ⚠️
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CUÁNDO USAR LAS HERRAMIENTAS:
-- **get_user**: Solo si necesitas el nombre del usuario y aún no lo tienes
-- **get_hours**: Cuando el usuario quiere ver opciones disponibles (necesitas sport + date)
-  * "¿Qué horarios tienes para mañana?"
-  * "Quiero reservar padel el sábado"
-  * "Dame más opciones"
-  * "Tienes horarios más tarde?"
-- **confirm_booking**: Solo cuando el usuario ha elegido específicamente un horario y acepta
-  * "Confirmo las 15:00"
-  * "Sí, me parece bien"
-  * "El de las 3 por favor"
-  * NUNCA confirmes sin que el usuario haya elegido explícitamente
+ANTES de responder CUALQUIER cosa:
+1. LEE TODOS los mensajes anteriores arriba
+2. EXTRAE toda la información que el usuario YA dio:
+   - ¿Ya dijo el deporte? (Padel/Pickleball)
+   - ¿Ya dijo la fecha? (mañana/16/sábado/etc)
+   - ¿Ya dijo la hora? (3pm/15:00/en la tarde)
+   - ¿Ya dijo el nombre?
 
-SI EL USUARIO DEBE HABLAR CON HUMANO:
-- Usuario pide hablar con dueño/gerente/manager
-- Queja seria o reclamo
-- Temas fuera de tu alcance (políticas, devoluciones, litigios)
-- Responde: "Dame un momento para revisar..." y establece needsEscalation=true en tu respuesta
+3. NUNCA vuelvas a preguntar información que YA tienes
 
-EXTRACCIÓN DE DATOS:
-- "Padel mañana a las 3" → sport: Padel, date: (mañana calculado), time: 15:00
-- "para el 16" → date: 2026-02-16 (usa el año actual)  
-- "9 por favor" o "el 11" → time: 09:00 o 11:00 (en contexto de selección de horarios)
-- "Mi nombre es Juan Pérez" → name: Juan, last_name: Pérez
+EJEMPLO CORRECTO:
+User: "Quiero reservar mañana"
+Tú: ¿Para qué deporte?
+User: "Padel en la tarde"
+Tú: [RECUERDAS: deporte=Padel, fecha=mañana, preferencia=tarde]
+     [LLAMAS: get_hours(sport="Padel", date=mañana)]
+     "Para Padel mañana tengo: 14:00, 15:00, 16:00..."
 
-CONVERSACIÓN ACTUAL:
-Contexto de sesión: ${JSON.stringify(sessionContext)}
+EJEMPLO INCORRECTO (NO HAGAS ESTO):
+User: "Quiero reservar mañana"
+Tú: ¿Para qué deporte?
+User: "Padel en la tarde"  
+Tú: ¿Para qué fecha? ❌ ← USUARIO YA DIJO "MAÑANA"
 
-Responde de manera natural y cálida. Si necesitas usar una herramienta, la llamarás automáticamente. NO digas "voy a revisar" o "déjame buscar" - simplemente hazlo.`;
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SESIÓN ACTUAL (datos ya capturados):
+${JSON.stringify(sessionContext, null, 2)}
+
+EXTRACCIÓN DE DATOS DEL USUARIO:
+- "mañana" → fecha = día siguiente (${dateStr})
+- "Padel" o "Pickleball" → deporte
+- "en la tarde" → preferencia de horario (14:00+)
+- "en la mañana" → preferencia de horario (<14:00)
+- "a las 3" o "las 3" → 15:00 (3pm)
+- "el 16" → fecha = 2026-02-16
+- Solo un número (9, 14, etc) → hora en formato 24h
+
+CUÁNDO USAR HERRAMIENTAS:
+- **get_hours**: Cuando tengas deporte + fecha → úsala INMEDIATAMENTE, no preguntes más
+- **confirm_booking**: Solo cuando usuario confirme un horario específico ("sí", "confirmo", "ese")
+
+FLUJO NATURAL (como humano):
+1. Usuario pide reserva
+2. Si falta deporte → pregunta
+3. Si falta fecha → pregunta  
+4. En cuanto tengas deporte + fecha → LLAMA get_hours AUTOMÁTICAMENTE
+5. Usuario elige hora → presenta confirmación
+6. Usuario dice "sí" → LLAMA confirm_booking
+
+NUNCA DIGAS:
+❌ "Voy a revisar"
+❌ "Déjame consultar"
+❌ "¿Para qué fecha?" (si ya dijeron la fecha)
+❌ "¿Qué deporte?" (si ya dijeron el deporte)
+
+SÉ NATURAL Y RECUERDA TODO.`;
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -1348,9 +1375,36 @@ async function handleWhatsApp(event) {
       session.userChecked = true;
     }
 
+    // Extract and remember data from this message BEFORE calling AI
+    // This ensures session context is up-to-date
+    const extractedSport = extractSport(text);
+    if (extractedSport) {
+      session.sport = extractedSport;
+      logger?.info?.(`[EXTRACT] Sport from text: ${extractedSport}`);
+    }
+
+    const extractedDate = resolveDate(text);
+    if (extractedDate) {
+      session.date = extractedDate;
+      logger?.info?.(`[EXTRACT] Date from text: ${extractedDate}`);
+    }
+
+    const extractedTime = extractTime(text);
+    if (extractedTime) {
+      session.desiredTime = extractedTime;
+      logger?.info?.(`[EXTRACT] Time from text: ${extractedTime}`);
+    }
+
+    const extractedDuration = extractDuration(text);
+    if (extractedDuration) {
+      session.duration = extractedDuration;
+      logger?.info?.(`[EXTRACT] Duration from text: ${extractedDuration}`);
+    }
+
     // Call agent with new tool-based architecture  
     const decision = await agentDecide(phone, text, session);
     logger?.info?.(`[AGENT] Response: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}, Escalation: ${decision.needsEscalation}`);
+    logger?.info?.(`[SESSION] Sport: ${session.sport}, Date: ${session.date}, Time: ${session.desiredTime}`);
 
     // Handle escalation immediately
     if (decision.needsEscalation) {
@@ -1392,8 +1446,17 @@ async function handleWhatsApp(event) {
           const sport = args.sport || session.sport || config.defaultSport;
           const date = args.date || session.date;
 
+          logger?.info?.(`[TOOL] get_hours - Sport: ${sport} (from args: ${args.sport}, session: ${session.sport})`);
+          logger?.info?.(`[TOOL] get_hours - Date: ${date} (from args: ${args.date}, session: ${session.date})`);
+
           if (!date) {
             await safeSendText(phone, "¿Para qué fecha quieres reservar?", flowToken);
+            await saveSession(phone, session);
+            return { actions: [] };
+          }
+
+          if (!sport) {
+            await safeSendText(phone, "¿Para qué deporte? Tengo Padel y Pickleball.", flowToken);
             await saveSession(phone, session);
             return { actions: [] };
           }
@@ -1405,6 +1468,8 @@ async function handleWhatsApp(event) {
           session.slots = slots;
           session.options = buildOptions(slots, session.duration || 1);
           session.hours = startTimesFromOptions(session.options);
+
+          logger?.info?.(`[TOOL] get_hours - Found ${session.options?.length || 0} options for ${sport} on ${date}`);
 
           if (!session.options?.length) {
             await safeSendText(phone, `No tengo horarios disponibles para ${formatDateEs(date)}. ¿Quieres revisar otra fecha?`, flowToken);
