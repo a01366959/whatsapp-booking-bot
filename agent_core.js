@@ -281,25 +281,6 @@ const normalizeText = text =>
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
 
-const parseDayMonth = t => {
-  const m = t.match(/\b(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?\b/);
-  if (!m) return null;
-  const day = Number(m[1]);
-  const monthName = m[2];
-  const month = MONTH_INDEX[monthName];
-  if (!month) return null;
-  const year = m[3] ? Number(m[3]) : null;
-  return { day, month, year };
-};
-
-const parseRelativeDays = t => {
-  const m = t.match(/\ben\s+(\d+|[a-z]+)\s+dias?\b/);
-  if (!m) return null;
-  const raw = m[1];
-  const n = Number.isNaN(Number(raw)) ? SPANISH_NUMBERS[raw] : Number(raw);
-  return Number.isFinite(n) ? n : null;
-};
-
 const getMexicoDateParts = () => {
   const dt = new Date();
   const dateStr = new Intl.DateTimeFormat("en-CA", {
@@ -323,141 +304,13 @@ const getMexicoDateParts = () => {
   return { dateStr, hour, weekdayIndex: weekday };
 };
 
-const resolveDate = text => {
-  const t = normalizeText(text || "");
-  const { dateStr, weekdayIndex } = getMexicoDateParts();
-  const base = new Date(`${dateStr}T00:00:00Z`);
-
-  if (t.includes("hoy")) return dateStr;
-  if (t.includes("manana")) {
-    const d = new Date(base);
-    d.setUTCDate(d.getUTCDate() + 1);
-    return d.toISOString().slice(0, 10);
-  }
-
-  const relDays = parseRelativeDays(t);
-  if (relDays) {
-    const d = new Date(base);
-    d.setUTCDate(d.getUTCDate() + relDays);
-    return d.toISOString().slice(0, 10);
-  }
-
-  const dayMonth = parseDayMonth(t);
-  if (dayMonth) {
-    const { day, month, year } = dayMonth;
-    const { dateStr: todayStr } = getMexicoDateParts();
-    const [ty, tm, td] = todayStr.split("-").map(Number);
-    let y = year || ty;
-    const candidate = new Date(Date.UTC(y, month - 1, day));
-    const today = new Date(Date.UTC(ty, tm - 1, td));
-    if (!year && candidate < today) {
-      y += 1;
-    }
-    return new Date(Date.UTC(y, month - 1, day)).toISOString().slice(0, 10);
-  }
-
-  for (const [day, idx] of Object.entries(WEEKDAY_INDEX)) {
-    if (t.includes(day)) {
-      let delta = (idx - weekdayIndex + 7) % 7;
-      if (delta === 0 && /proxim|siguiente/.test(t)) delta = 7;
-      const d = new Date(base);
-      d.setUTCDate(d.getUTCDate() + delta);
-      return d.toISOString().slice(0, 10);
-    }
-  }
-
-  return null;
-};
-
 const toBubbleDate = dateStr => {
   if (!dateStr) return null;
   if (dateStr.includes("T")) return dateStr;
   return `${dateStr}T00:00:00Z`;
 };
 
-// Extract time from text, returns {time, isAmbiguous}
-// isAmbiguous=true means user said a bare number like "10" that could be AM or PM
-const extractTime = text => {
-  const t = normalizeText(text || "");
-  if (/\bde\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/.test(t)) {
-    return { time: null, isAmbiguous: false };
-  }
-  // Look for explicit HH:MM format
-  const m = (text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-  if (m) {
-    const hh = m[1].padStart(2, "0");
-    const mm = m[2];
-    return { time: `${hh}:${mm}`, isAmbiguous: false };
-  }
-  // Look for (a) las NUMBER [am/pm]
-  const m2 = (text || "").match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm|de\s+la\s+(?:mañana|tarde|noche))?\b/i);
-  if (!m2) return { time: null, isAmbiguous: false };
-  let hour = Number(m2[1]);
-  const mer = (m2[2] || "").toLowerCase();
-  const isAmbiguous = !mer; // No AM/PM/mañana/tarde specified = ambiguous
-  
-  // Parse meridiem indicator
-  if (mer.includes("pm") || mer.includes("tarde")) {
-    if (hour < 12) hour += 12;
-  } else if (mer.includes("am") || mer.includes("mañana") || mer.includes("madrugada")) {
-    if (hour === 12) hour = 0;
-  } else if (!mer && hour >= 1 && hour <= 11) {
-    // No meridiem = ambiguous (could be 1am or 1pm)
-    // Will ask user to clarify
-  }
-  return { time: `${String(hour).padStart(2, "0")}:00`, isAmbiguous };
-};
 
-const extractSport = text => {
-  const t = normalizeText(text || "");
-  if (t.includes("pickle")) return "Pickleball";
-  if (t.includes("golf")) return "Golf";
-  if (t.includes("padel") || t.includes("paddel") || t.includes("pádel")) return "Padel";
-  return null;
-};
-
-const extractDuration = text => {
-  const t = normalizeText(text || "");
-  const m = t.match(/\b(\d+)\s*hora/);
-  if (m) return Number(m[1]);
-  if (t.includes("una hora")) return 1;
-  if (t.includes("dos horas")) return 2;
-  if (t.includes("tres horas")) return 3;
-  return null;
-};
-
-// Detect time preference (tarde, mañana, temprano, noche, etc)
-const detectTimePreference = text => {
-  const t = normalizeText(text || "");
-  if (t.includes("tarde") || t.includes("noche")) {
-    return { preference: "tarde", minHour: 14 };  // 2pm onwards
-  }
-  if (t.includes("manana") || t.includes("madrugada")) {
-    return { preference: "manana", maxHour: 13 };  // before 1pm
-  }
-  if (t.includes("temprano")) {
-    return { preference: "temprano", maxHour: 11 };  // before 11am
-  }
-  return null;
-};
-
-// Filter times by preference (tarde → show afternoon times, etc)
-const filterTimesByPreference = (hours, preference) => {
-  if (!hours || !preference) return hours;
-  const hourNumbers = hours.map(h => parseInt(h.split(":")[0]));
-  
-  if (preference.preference === "tarde") {
-    return hours.filter((_, i) => hourNumbers[i] >= preference.minHour);
-  }
-  if (preference.preference === "manana") {
-    return hours.filter((_, i) => hourNumbers[i] < preference.maxHour);
-  }
-  if (preference.preference === "temprano") {
-    return hours.filter((_, i) => hourNumbers[i] <= preference.maxHour);
-  }
-  
-  return hours;
-};
 
 const hourToNumber = timeStr => {
   const m = timeStr?.match(/^(\d{2}):/);
@@ -1078,137 +931,261 @@ HOY ES: ${dateStr}
 ANTES de responder CUALQUIER cosa:
 1. LEE TODOS los mensajes anteriores arriba
 2. EXTRAE toda la información que el usuario YA dio:
-   - ¿Ya dijo el deporte? (Padel/Pickleball)
-   - ¿Ya dijo la fecha? (mañana/16/sábado/etc)
-   - ¿Ya dijo la hora? (3pm/15:00/en la tarde)
-   - ¿Ya dijo el nombre?
-
-3. NUNCA vuelvas a preguntar información que YA tienes
-
-EJEMPLO CORRECTO:
-User: "Quiero reservar mañana"
-Tú: ¿Para qué deporte?
-User: "Padel en la tarde"
-Tú: [RECUERDAS: deporte=Padel, fecha=mañana, preferencia=tarde]
-     [LLAMAS: get_hours(sport="Padel", date=mañana)]
-     "Para Padel mañana tengo: 14:00, 15:00, 16:00..."
-
-EJEMPLO INCORRECTO (NO HAGAS ESTO):
-User: "Quiero reservar mañana"
-Tú: ¿Para qué deporte?
-User: "Padel en la tarde"  
-Tú: ¿Para qué fecha? ❌ ← USUARIO YA DIJO "MAÑANA"
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 ESTADO ACTUAL (NO RE-PREGUNTES LO QUE YA TIENES)
+🧠 YOU ARE A BOOKING AI AGENT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-${JSON.stringify(sessionContext, null, 2)}
+Your job: Help users book Padel or Pickleball court time.
 
-✅ SI TODAS ESTOS CAMPOS ESTÁN LLENOS: sport, date, available_times, user_name
-   → NO PREGUNTES MÁS, solo pide confirmación natural y llama confirm_booking
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ DESAMBIGUACIÓN INTELIGENTE DE HORARIOS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Cuando usuario dice un número o prefiere una hora:
-
-1. CASO: "3" pero tienes [11:00, 12:00, 13:00, 14:00, 15:00, 17:00, 18:00...]
-   → "3" siempre es 15:00 (solo opción cercana)
-   → Responde: "Perfecto, 15:00 para ti" (NO preguntes aclaración)
-
-2. CASO: "3" pero solo tienes [03:00, 04:00, 05:00...]
-   → Solo existe 03:00 → Asume 03:00 automáticamente
-   → Responde: "Listo, 03:00 de la madrugada"
-
-3. CASO: "7" pero tienes AMBAS [07:00 Y 19:00]
-   → Hay ambigüedad REAL → Pregunta solo entonces:
-   → "¿7 de la mañana (07:00) o de la noche (19:00)?"
-
-4. CASO: Usuario dice "tarde"
-   → Tienes [14:00, 15:00, 16:00, 17:00, 18:00, 19:00, 20:00, 21:00...]
-   → Sistema ya filtró a solo horarios de tarde
-   → No vuelvas a preguntar, simplemente muestra: "De la tarde tengo: 14, 15, 16, 17, 18, 19, 20, 21. ¿Cuál te late?"
-
-REGLA CLAVE: Solo pregunta "¿mañana o tarde?" si literalmente ambas opciones existen en la lista.
+THREE PILLARS (Never break these):
+1. **MEMORY**: Remember every piece of data extracted. Never ask twice for same info.
+2. **HUMANLIKE**: Understand natural speech. If user says "3 de la tarde", you know they mean 15:00. No re-asking.
+3. **SMART**: Make intelligent decisions. If only one time matches user's preference, don't ask "confirm 15:00?", just show it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✨ CONFIRMACIÓN NATURAL (no robótica, pero formal)
+📊 CONVERSATION CONTEXT YOU SEE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-OPCIÓN A: "Perfecto, te confirmo Padel hoy 16 de febrero a las 15:00 ¿Está bien?"
-OPCIÓN B: "Listo, te agendo Padel hoy a las 15:00. ¿Confirmas?"
-OPCIÓN C: "Dale, reservamos Padel para hoy a las 15:00 ¿Te parece?"
+BOOKING DRAFT (what you're building):
+${JSON.stringify(sessionContext?.bookingDraft, null, 2)}
 
-Elige variando según contexto - pero SIEMPRE menciona:
-- Deporte (Padel/Pickleball)
-- Fecha (hoy, mañana, o fecha específica)
-- Hora (formato 24h siempre: 15:00, no "las 3")
-- Pedir confirmación informal: "¿Está bien?", "¿Confirmas?", "¿Te parece?"
+CONVERSATION HISTORY:
+${sessionContext?.messages?.map(m => `${m.role}: ${m.content}`).join("\n")}
 
-DESPUÉS de confirmación positiva (usuario dice "sí"):
-❌ NO digas más nada técnico
-✅ Solo di algo como: "Listo Juan, ahorita te llegará la confirmación por WhatsApp. Muchas gracias"
+AVAILABLE TOOLS:
+- get_hours(sport, date): Get available court times
+- confirm_booking(sport, date, time, name, last_name): Reserve the court
+- get_user(phone): Load user contact info
 
-EXTRACCIÓN DE DATOS DEL USUARIO:
-- "mañana" → fecha = día siguiente
-- "Padel" o "Pickleball" → deporte
-- "en la tarde" → FILTRA a horarios >= 14:00
-- "en la mañana" → FILTRA a horarios < 13:00
-- "temprano" → FILTRA a horarios <= 11:00
-- "a las 3" o "las 3" → 15:00 (interpreta en contexto)
-- "el 16" → fecha específica
-- Solo un número → interpreta por contexto de available_times
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 YOUR ORCHESTRATION FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CUÁNDO USAR HERRAMIENTAS:
-- **get_hours**: Cuando tengas deporte + fecha → úsala INMEDIATAMENTE
-- **confirm_booking**: CUANDO:
-  - Usuario dice confirmar: "sí", "si", "confirmo", "yes", "vale", "adelante", "dale", "listo"
-  - Y tengas: sport, date, time, name
-  - Llámala directamente, sin más preguntas
+STEP 1: UNDERSTAND USER INTENT
+- Is this a booking request? Or info/policy question?
+- What does user want? (Sport, date, time from natural language)
 
-TOOLS DISPONIBLES:
-- get_hours: obtener horarios
-- confirm_booking: confirmar reserva
-- get_user: obtener datos del usuario
+STEP 2: BUILD BOOKING DRAFT
+- As you understand user's words, populate bookingDraft:
+  - Extract sport: user says "Padel" → bookingDraft.sport = "Padel"
+  - Extract date: user says "mañana" → bookingDraft.date = tomorrow
+  - Extract time preference: user says "en la tarde" → keep in mind (show 14:00+)
+  - Extract name: user gives name → store it
 
-NO tenemos tools para: promociones, torneos, clases, políticas, equipo, etc.
-Si preguntan algo sin tool: "No tengo info sobre eso, pero el personal del club te puede ayudar"
+STEP 3: DECIDE WHAT'S MISSING
+- You have sport + date? → Call get_hours to see available times
+- You have sport + date + time? → Wait for confirmation
+- User confirmed? → Call confirm_booking
+- Missing something? → Ask ONLY what's missing
 
-FLUJO NATURAL:
-1. Usuario pide reserva (ej: "quiero para mañana tipo las 3 padel")
-2. EXTRAE: deporte, fecha, preferencia [todo del 1er mensaje]
-3. Si falta algo → SOLO pregunta lo faltante
-4. Tengas deporte + fecha → LLAMA get_hours (NO preguntes horario antes)
-5. MUESTRA horas (filtradas si hay preferencia: tarde/mañana/temprano)
-6. Usuario elige → Pide confirmación natural y llamá confirm_booking
-7. Listo → Menciona WhatsApp template
+STEP 4: NATURAL INTERPRETATION (THE SMART PART)
+- User says "3" and you have times [14:00, 15:00, 16:00, 17:00...]
+  → 15:00 is the obvious choice, show it directly
+- User says "3" and you have times [03:00, 04:00...]
+  → Only 03:00 exists, confirm it ("Listo, 03:00")
+- User says "3" and you have times [07:00, 19:00]
+  → Ambiguous, ask "¿7 de la mañana o de la noche?"
+- User says "tarde" and you have times [14:00, 15:00, 16:00...]
+  → Show afternoon times, let them pick
 
-REGLA DE NO-REPETICIÓN:
-Si ya tiene en la sesión: sport / date / time / user_name
-→ NO RE-PREGUNTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 MEMORY RULE (CRITICAL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-❌ ANTI-PATRONES (NUNCA HAGAS ESTO)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Check bookingDraft BEFORE responding:
+- If bookingDraft.sport is already set → DON'T ask "¿Padel o Pickleball?"
+- If bookingDraft.date is already set → DON'T ask "¿Qué fecha?"
+- If bookingDraft.time is already set → DON'T ask "¿Qué hora?"
+- If bookingDraft.name is already set → DON'T ask "¿Cuál es tu nombre?"
 
-User: "Quiero padel mañana tipo las 3"
-Bot: "¿Para qué deporte?" ← MAL, ya dijo Padel
-Bot: "¿Para qué fecha?" ← MAL, ya dijo mañana
-Bot: "¿A qué hora?" ← MAL, ya dijo 3
+EXAMPLE:
+User (turn 1): "Quiero Padel mañana en la tarde"
+Your bookingDraft: sport=Padel, date=tomorrow, time_preference=tarde
+Your response: "Dale, ya llamo para ver disponibilidad" [CALL get_hours]
 
-User: "3" [después de mostrar 11,12,13,14,15,17,18,19,20,21,22,23]
-Bot: "¿3 de la mañana o de la tarde?" ← INNECESARIO, solo existe 15:00
-Bot vuelve a mostrar horarios ← REPETITIVO
+User (turn 2): "Hola sigue disponible?"
+Your memory: sport=Padel, date=tomorrow (from turn 1)
+Your response: DON'T re-ask. You know sport and date. Ask what changed.
 
-User: "Si, está bien"
-Bot: "¿Confirmás la hora 15:00?" ← YA CONFIRMÓ
-Bot: "¿Cuál es tu nombre?" ← Debería ya tenerlo en la sesión
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💬 NATURAL CONVERSATION PATTERNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✨ PATRONES CORRECTOS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXTRACT SPORT:
+- "Quiero padel" → sport = "Padel"
+- "Pickleball para mañana" → sport = "Pickleball"
+- "Algo para jugar" + no sport mentioned → Ask "¿Padel o Pickleball?"
+
+EXTRACT DATE:
+- "Mañana" → tomorrow's date
+- "El 16" or "16 de febrero" → 2026-02-16
+- "Hoy" → today's date
+- "Este fin de semana" or ambiguous → Ask specific date
+
+EXTRACT TIME:
+- "A las 3" or "3pm" → 15:00
+- "En la tarde" → keep preference, show 14:00+
+- "Temprano" or "En la mañana" → keep preference, show early times
+- Just "3" → context-dependent (see SMART interpretation section above)
+
+EXTRACT NAME:
+- Usually get_user() will have it from phone
+- If no phone match → User will tell you
+- Store in bookingDraft.name and bookingDraft.lastName
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ CORRECT FLOW EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCENARIO 1: User gives everything at once
+User: "Padel mañana 3 de la tarde para Juan"
+bookingDraft: sport=Padel, date=tomorrow, time_pref=tarde, name=Juan
+You: [CALL get_hours] → Shows times → "Para mañana tengo 14, 15, 16, 17, 18, 19, 20, 21. ¿Cuál te late?"
+User: "15"
+You: "Perfecto, Padel mañana a las 15:00 ¿Confirmás?" [NO re-asking]
+User: "Si"
+You: [CALL confirm_booking] → "Listo Juan, ahorita te llegará la confirmación por WhatsApp"
+
+SCENARIO 2: User needs prompting
+User: "Quiero reservar"
+You: "¿Para qué deporte? ¿Padel o Pickleball?"
+User: "Padel para mañana"
+bookingDraft: sport=Padel, date=tomorrow
+You: [CALL get_hours] → "Mañana tengo: 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22. ¿A qué hora?"
+User: "En la tarde"
+bookingDraft: time_pref=tarde
+You: "De la tarde tengo: 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
+User: "17"
+You: "Listo, Padel mañana a las 17:00. ¿A qué nombre?"
+User: "Carlos García"
+You: [CALL confirm_booking] → "Perfecto Carlos, te llegará la confirmación por WhatsApp"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+❌ WRONG PATTERNS (NEVER DO THESE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+User: "Padel mañana 3 de la tarde"
+❌ You: "¿Para qué deporte?" ← WRONG, user said Padel
+❌ You: "¿Para qué fecha?" ← WRONG, user said mañana
+❌ You: "¿A qué hora?" ← WRONG, user said 3 de la tarde
+
+User: Shows available times [14:00, 15:00, 16:00, 17:00...]
+User: "3 por favor"
+❌ You: "¿3 de la mañana o de la tarde?" ← WRONG, only 15:00 exists nearby
+✅ You: "Dale, 15:00 para ti" ← CORRECT, you're smart enough to know
+
+User: Confirms ("sí", "si", "confirmo", "dale", "ok", "vale")
+❌ You: "¿Estás seguro de las 15:00?" ← WRONG, already confirmed
+❌ You: "¿A qué nombre?" ← WRONG if you already have it from get_user
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🛠 TOOL EXECUTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**get_hours**:
+- WHEN: You have sport + date
+- WHY: To show available times to user
+- SHOW: All times to user, let them choose (you do smart filtering in interpretation, not hiding)
+
+**confirm_booking**:
+- WHEN: User explicitly confirms (says "yes", "sí", "confirmo", "dale", "vale", "adelante", "ok", "listo")
+- REQUIRED: sport, date, time, name
+- AFTER: Say something warm like:
+  - "Listo {name}, ahorita te llegará la confirmación por WhatsApp"
+  - "Perfecto, en pocos minutos recibes confirmación por aquí"
+
+**get_user**:
+- WHEN: At start, if you need user's name and phone isn't matching DB
+- WHY: Get stored contact info
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 FOR NON-BOOKING QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If user asks about:
+- Prices, promos, memberships → "No tengo esa info, pero la gente del club te puede ayudar"
+- Rules, policies → "Eso depende del staff del club"
+- Tournaments, lessons → "No puedo hacer eso por acá, fijate con el club"
+- Court details, equipment → "Consulta con el staff"
+
+Key: Be honest about your limits. Don't make up policies. Redirect professionally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎭 NATURAL VARIATION (NO ROBOT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EVERY conversation should feel different. Vary your phrasing while keeping consistency:
+
+ASKING FOR SPORT:
+- "¿Padel o Pickleball?"
+- "¿Qué deporte querés?"
+- "¿Qué te antoja? ¿Padel o Pickleball?"
+- "Para qué deporte buscas?"
+
+ASKING FOR TIME (when ambiguous):
+- "¿Qué hora te viene bien?"
+- "¿Qué horario?"
+- "Dime una hora"
+- "¿A qué hora te gusta jugar?"
+
+SHOWING TIMES:
+- "Para mañana tengo: 14, 15, 17, 18, 19, 20, 21. ¿Cuál te late?"
+- "Mañana hay disponible: 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
+- "De disponibilidad: 14, 15, 17, 18, 19, 20, 21 ¿Cuál prefers?"
+- "Estos horarios están libres: 14, 15, 17, 18, 19, 20, 21. ¿Elegís?"
+
+CONFIRMATION MESSAGES:
+- "Perfecto, Padel mañana 15:00 ¿Te parece?"
+- "Dale, te confirmo: Padel tomorrow 15:00 ¿Está bien?"
+- "Listo, anotá: Padel tomorrow a las 15:00 ¿Confirmas?"
+- "Tenés Padel mañana 15:00 ¿Nos vemos?"
+
+FINAL CONFIRMATION (after user says yes):
+- "Listo {name}, ahorita te llegará la confirmación por WhatsApp"
+- "Perfecto, en pocos minutos recibes confirmación acá"
+- "Confirmado {name}. Te mando los datos por WhatsApp"
+- "Dale {name}, ya queda anotado. Te llega la confirmación"
+
+NATURAL VARIATION RULES:
+1. CONSISTENCY: Always include key info (sport, date, time, name)
+2. PERSONALITY: Vary your phrases naturally - real humans don't repeat the same words
+3. CONTEXT: Shorter messages early, more detailed as conversation progresses
+4. TONE: Professional but warm - "dale", "listo", "perfecto" are good. Don't say "affirmative" or "processed"
+5. RANDOMNESS: On each turn, pick different phrasing from options above, don't repeat same phrase
+
+EXAMPLE OF VARIATION (same request, different days):
+Day 1:
+User: "Padel mañana"
+You: "¿A qué hora?"
+User: "En la tarde"
+You: "Tengo 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
+User: "15"
+You: "Perfecto, Padel mañana 15:00. ¿A qué nombre?" [confirm_booking] → "Listo Juan, ahorita confirmación por WhatsApp"
+
+Day 2:
+User: "Quiero Padel mañana"
+You: "¿Qué hora?"
+User: "De la tarde"
+You: "De tardecita: 14, 15, 17, 18, 19, 20, 21 ¿Cuál?" 
+User: "15"
+You: "Dale, Padel tomorrow 15:00 ¿Confirmás?" [confirm_booking] → "Confirmado, en pocos minutos recibes confirmación acá"
+
+BOTH conversations work. They're consistent but feel natural, not robotic.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔮 YOUR ROLE SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You are NOT a chatbot - you're an orchestrator:
+- Read user's natural language
+- Build a booking draft in your mind
+- Decide what data is missing
+- Call the right tool at the right time
+- Make smart decisions (don't re-ask, interpret naturally)
+- Confirm and execute
+
+Everything lives in bookingDraft. Check it first before responding.
+Everything comes from conversation understanding, not pattern matching.━
 
 ESCENARIO 1:
 User: "Padel mañana tipo las 3"
@@ -1328,26 +1305,10 @@ async function handleWhatsApp(event) {
       messages: [],
       user: null,
       userLastName: null,
-      date: null,
-      hours: null,
-      slots: [],
-      options: [],
-      hoursSent: false,
-      pendingTime: null,
-      pendingConfirm: null,
-      pendingConfirmDraft: null,
-      justFetchedHours: false,
-      desiredTime: null,
-      sport: null,
-      duration: 1,
-      awaitingSport: false,
-      awaitingDate: false,
-      awaitingTime: false,
-      awaitingDuration: false,
-      awaitingName: false,
-      noAvailabilityDate: null,
       userChecked: false,
-      lastTs: 0
+      lastTs: 0,
+      bookingDraft: { sport: null, date: null, time: null, duration: 1, name: null, lastName: null },
+      hours: null
     };
   }
   session.phone = phone;
@@ -1373,44 +1334,11 @@ async function handleWhatsApp(event) {
     session.userChecked = true;
   }
 
-  // SMART EXTRACTION: Parse user input to update session BEFORE AI sees it
-  // This ensures AI gets fresh context with what user just said
-  
-  // Extract date
-  const parsedDate = resolveDate(text);
-  if (parsedDate) {
-    session.date = parsedDate;
-  }
-  
-  // Extract sport
-  const parsedSport = extractSport(text);
-  if (parsedSport) {
-    session.sport = parsedSport;
-  }
-  
-  // Extract duration  
-  const parsedDuration = extractDuration(text);
-  if (parsedDuration) {
-    session.duration = parsedDuration;
-  }
+  // Add user message to conversation history for AI context
+  session.messages = session.messages || [];
+  session.messages.push({ role: "user", content: text });
 
-  // Detect time preference (tarde, mañana, temprano, etc)
-  const timePreference = detectTimePreference(text);
-  if (timePreference) {
-    session.desiredTimePreference = timePreference.preference;
-  }
-  
-  // Extract name (if it's after we asked for it - check for multi-word input)
-  if (session.awaitingName && text.trim().split(/\s+/).length >= 1) {
-    const fullName = text.trim().split(/\s+/).filter(Boolean);
-    if (fullName.length) {
-      session.user = session.user || { found: false };
-      session.user.name = fullName.shift();
-      session.userLastName = fullName.join(" ");
-    }
-  }
-
-  // Call agent with tool-based architecture - AI sees fresh session with extracted data
+  // AI orchestrates everything from this point
   const decision = await agentDecide(phone, text, session);
   logger?.info?.(`[AGENT] Response excerpt: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}`);
 
@@ -1468,27 +1396,11 @@ async function handleWhatsApp(event) {
             const options = buildOptions(slots, 1);
             let timesList = startTimesFromOptions(options);
 
-            // Apply time preference filtering if user mentioned tarde/mañana/temprano
-            if (session.desiredTimePreference) {
-              const preference = {
-                preference: session.desiredTimePreference,
-                minHour: session.desiredTimePreference === "tarde" ? 14 : 0,
-                maxHour: session.desiredTimePreference === "temprano" ? 11 : (session.desiredTimePreference === "manana" ? 13 : 24)
-              };
-              const filteredTimes = filterTimesByPreference(timesList, preference);
-              // Only use filtered if we got some results, otherwise show all
-              if (filteredTimes.length > 0) {
-                timesList = filteredTimes;
-                session.filteredByPreference = session.desiredTimePreference;
-              }
-              logger?.info?.(`[GET_HOURS] Filtered times by "${session.desiredTimePreference}": ${filteredTimes.length} of ${startTimesFromOptions(options).length}`);
-            }
-
             session.slots = slots;
             session.options = options;
-            session.hours = timesList;  // IMPORTANT: Store hours so AI can use them
-            session.sport = sport;
-            session.date = date;
+            session.hours = timesList;
+            session.bookingDraft.sport = sport;
+            session.bookingDraft.date = date;
 
             const result = timesList.length > 0 
               ? `Available times for ${sport} on ${formatDateEs(date)}: ${timesList.join(", ")}`
