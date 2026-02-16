@@ -1018,7 +1018,13 @@ When user says a time and you have available_times:
 - User: "tarde" + available_times with afternoon slots → show filtered times, user picks one
 - User picks specific time from list → bookingDraft.time = that time
 
-RULE 5: CONFIRMATION FLOW:
+RULE 5: CONVERSATION PROGRESSION (Never loop):
+After you show available times and ask user to pick:
+→ User says "15:00" or picks any time → bookingDraft.time is LOCKED
+→ User confirms ("sí", "dale", "15:00 está bien") → time choice is FINAL
+→ NEVER ask about time again. Move to NEXT step: ask for name
+→ If user says "yes" and you already have sport+date+time → DON'T re-confirm time
+→ Just ask for the NEXT missing field (name, or call confirm_booking if name exists)RULE 5: CONFIRMATION FLOW:
 When bookingDraft is COMPLETE (sport + date + time + name):
 → Send confirmation message (examples below)
 → IMMEDIATELY call confirm_booking
