@@ -375,24 +375,37 @@ const toBubbleDate = dateStr => {
   return `${dateStr}T00:00:00Z`;
 };
 
+// Extract time from text, returns {time, isAmbiguous}
+// isAmbiguous=true means user said a bare number like "10" that could be AM or PM
 const extractTime = text => {
   const t = normalizeText(text || "");
   if (/\bde\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/.test(t)) {
-    return null;
+    return { time: null, isAmbiguous: false };
   }
+  // Look for explicit HH:MM format
   const m = (text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (m) {
     const hh = m[1].padStart(2, "0");
     const mm = m[2];
-    return `${hh}:${mm}`;
+    return { time: `${hh}:${mm}`, isAmbiguous: false };
   }
-  const m2 = (text || "").match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm)?\b/i);
-  if (!m2) return null;
+  // Look for (a) las NUMBER [am/pm]
+  const m2 = (text || "").match(/\b(?:a\s+las\s+)?([01]?\d|2[0-3])\s*(am|pm|de\s+la\s+(?:mañana|tarde|noche))?\b/i);
+  if (!m2) return { time: null, isAmbiguous: false };
   let hour = Number(m2[1]);
   const mer = (m2[2] || "").toLowerCase();
-  if (mer === "pm" && hour < 12) hour += 12;
-  if (mer === "am" && hour === 12) hour = 0;
-  return `${String(hour).padStart(2, "0")}:00`;
+  const isAmbiguous = !mer; // No AM/PM/mañana/tarde specified = ambiguous
+  
+  // Parse meridiem indicator
+  if (mer.includes("pm") || mer.includes("tarde")) {
+    if (hour < 12) hour += 12;
+  } else if (mer.includes("am") || mer.includes("mañana") || mer.includes("madrugada")) {
+    if (hour === 12) hour = 0;
+  } else if (!mer && hour >= 1 && hour <= 11) {
+    // No meridiem = ambiguous (could be 1am or 1pm)
+    // Will ask user to clarify
+  }
+  return { time: `${String(hour).padStart(2, "0")}:00`, isAmbiguous };
 };
 
 const extractSport = text => {
@@ -1021,7 +1034,7 @@ INFORMACIÓN DEL CLUB:
 - Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México
 - Horarios: Lunes a viernes 7:00-22:00, Sábado y domingo 8:00-15:00
 - Deportes: Padel, Pickleball
-- WhatsApp: +52 56 5440 7815
+- Contacto: WhatsApp +52 56 5440 7815 (donde estás)
 
 HOY ES: ${dateStr}
 
@@ -1065,18 +1078,26 @@ EXTRACCIÓN DE DATOS DEL USUARIO:
 - "en la mañana" → preferencia de horario (<14:00)
 - "a las 3" o "las 3" → 15:00 (3pm)
 - "el 16" → fecha = 2026-02-16
-- Solo un número (9, 14, etc) → hora en formato 24h
+- Solo un número (9, 14, etc) → hora en formato 24h (NOTA: si es ambiguo, pregunta "¿9 de la mañana o de la noche?")
 
 CUÁNDO USAR HERRAMIENTAS:
 - **get_hours**: Cuando tengas deporte + fecha → úsala INMEDIATAMENTE, no preguntes más
 - **confirm_booking**: Solo cuando usuario confirme un horario específico ("sí", "confirmo", "ese")
+
+TOOLS DISPONIBLES:
+- get_hours, confirm_booking, get_user
+
+NO tenemos tools para: promociones, torneos, clases, información de políticas, etc.
+Si preguntan algo que no puedes resolver con los tools disponibles, sé honesto:
+❌ NO DIGAS: "Te recomendaría que te pongas en contacto"
+✅ SÍ DI: "No tengo información sobre eso, pero los chicos del staff sabrían"
 
 FLUJO NATURAL (como humano):
 1. Usuario pide reserva
 2. Si falta deporte → pregunta
 3. Si falta fecha → pregunta  
 4. En cuanto tengas deporte + fecha → LLAMA get_hours AUTOMÁTICAMENTE
-5. Usuario elige hora → presenta confirmación
+5. Usuario elige hora → presenta confirmación CON CLARIFICACIÓN (ej: "10 de la mañana")
 6. Usuario dice "sí" → LLAMA confirm_booking
 
 NUNCA DIGAS:
@@ -1084,8 +1105,9 @@ NUNCA DIGAS:
 ❌ "Déjame consultar"
 ❌ "¿Para qué fecha?" (si ya dijeron la fecha)
 ❌ "¿Qué deporte?" (si ya dijeron el deporte)
+❌ "Te recomendaría que te pongas en contacto con..."
 
-SÉ NATURAL Y RECUERDA TODO.`;
+SÉ NATURAL, HONESTO, Y RECUERDA TODO.`;
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -1469,42 +1491,57 @@ async function handleWhatsApp(event) {
           session.options = buildOptions(slots, session.duration || 1);
           session.hours = startTimesFromOptions(session.options);
 
-          logger?.info?.(`[TOOL] get_hours - Found ${session.options?.length || 0} options for ${sport} on ${date}`);
+          // FILTER by time-of-day preference (mañana/tarde) if user mentioned it
+          let filteredOptions = session.options;
+          const prefersTarde = /\b(tarde|en\s+la\s+tarde|por\s+la\s+tarde)\b/i.test(text);
+          const prefersMañana = /\b(mañana|en\s+la\s+mañana|por\s+la\s+mañana|temprano)\b/i.test(text);
+          
+          if (prefersTarde) {
+            filteredOptions = session.options.filter(o => {
+              const hour = parseInt(o.start.split(':')[0]);
+              return hour >= 14; // afternoon = 14:00 onwards
+            });
+            logger?.info?.(`[TOOL] get_hours - Filtering for TARDE, reduced from ${session.options.length} to ${filteredOptions.length}`);
+          } else if (prefersMañana) {
+            filteredOptions = session.options.filter(o => {
+              const hour = parseInt(o.start.split(':')[0]);
+              return hour < 14; // morning = before 14:00
+            });
+            logger?.info?.(`[TOOL] get_hours - Filtering for MAÑANA, reduced from ${session.options.length} to ${filteredOptions.length}`);
+          }
+          
+          session.filteredOptions = filteredOptions;
+          session.hours = startTimesFromOptions(filteredOptions);
 
-          if (!session.options?.length) {
-            await safeSendText(phone, `No tengo horarios disponibles para ${formatDateEs(date)}. ¿Quieres revisar otra fecha?`, flowToken);
+          logger?.info?.(`[TOOL] get_hours - Found ${filteredOptions?.length || 0} options for ${sport} on ${date} (after filtering)`);
+
+          if (!filteredOptions?.length) {
+            const noTimesMsg = prefersTarde ? "No tengo horarios en la tarde" : 
+                               prefersMañana ? "No tengo horarios en la mañana" : 
+                               `No tengo horarios disponibles para ${formatDateEs(date)}`;
+            await safeSendText(phone, `${noTimesMsg}. ¿Quieres revisar otra fecha o cambiar la hora?`, flowToken);
             session.date = null;
             await saveSession(phone, session);
             return { actions: [] };
           }
 
           // Extract time from user text if they mentioned one
-          const timeMatch = text.match(/\b(a las|las)?\s*(\d{1,2})(:\d{2})?\s*(am|pm|de la tarde|de la mañana)?\b/i);
-          if (timeMatch) {
-            let hour = parseInt(timeMatch[2]);
-            const isPM = /pm|tarde/i.test(timeMatch[4] || '');
-            const isAM = /am|mañana/i.test(timeMatch[4] || '');
+          const timeExtracted = extractTime(text);
+          if (timeExtracted.time) {
+            session.desiredTime = timeExtracted.time;
             
-            // Convert to 24h format
-            if (isPM && hour < 12) hour += 12;
-            if (isAM && hour === 12) hour = 0;
-            if (!isPM && !isAM && hour >= 1 && hour <= 11) hour += 12; // Assume PM for booking context
-            
-            session.desiredTime = `${String(hour).padStart(2, '0')}:00`;
-          } else {
-            // Check if user just said a number (in context of selecting time)
-            const numberMatch = text.match(/\b(\d{1,2})\b/);
-            if (numberMatch && session.options?.length) {
-              const num = parseInt(numberMatch[1]);
-              if (num >= 0 && num <= 23) {
-                session.desiredTime = `${String(num).padStart(2, '0')}:00`;
-              }
+            // If time is ambiguous (bare number), ask for clarification
+            if (timeExtracted.isAmbiguous) {
+              const hour = parseInt(timeExtracted.time.split(':')[0]);
+              await safeSendText(phone, `¿A las ${hour} de la mañana o de la noche?`, flowToken);
+              await saveSession(phone, session);
+              return { actions: [] };
             }
           }
 
           // If user specified a time, check if it's available
           if (session.desiredTime) {
-            const match = session.options.find(o => o.start === session.desiredTime);
+            const match = filteredOptions.find(o => o.start === session.desiredTime);
             if (match) {
               // Time is available, prepare confirmation
               const name = session.user?.name || "";
@@ -1526,7 +1563,12 @@ async function handleWhatsApp(event) {
               const reservationName = name || "Cliente";
               const dateFormatted = formatDateEs(session.date);
               const timeFormatted = formatTimeRange(match.times);
-              const summaryMsg = `Perfecto, ${reservationName}. Entonces confirmamos: ${session.sport} el ${dateFormatted} a las ${timeFormatted}. ¿Te parece bien?`;
+              
+              // Add clarification for ambiguous times (10 → 10 de la mañana, 22 → 10 de la noche)
+              const hour = parseInt(match.times[0].split(':')[0]);
+              const timeClarity = hour < 12 ? "de la mañana" : hour < 19 ? "de la tarde" : "de la noche";
+              
+              const summaryMsg = `Perfecto, ${reservationName}. Entonces confirmamos: ${session.sport} el ${dateFormatted} a las ${match.times[0]} ${timeClarity}. ¿Te parece bien?`;
               
               session.pendingConfirm = {
                 date: session.date,
@@ -1540,8 +1582,8 @@ async function handleWhatsApp(event) {
               await saveSession(phone, session);
               return { actions: [] };
             } else {
-              // Desired time not available, show closest options
-              const suggestions = pickClosestOptions(session.options, session.desiredTime);
+              // Desired time not available, show closest options from filtered list
+              const suggestions = pickClosestOptions(filteredOptions, session.desiredTime);
               const timeList = suggestions.map(o => o.start).join(", ");
               await safeSendText(phone, `No tengo ${session.desiredTime}. Tengo ${timeList}. ¿Te funciona alguno?`, flowToken);
               await saveSession(phone, session);
