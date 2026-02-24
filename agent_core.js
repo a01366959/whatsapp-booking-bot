@@ -245,6 +245,48 @@ const TOOL_RESPONSE_EXPECTATIONS = {
   }
 };
 
+const AGENT_POLICY = {
+  criticalRules: [
+    "No repitas preguntas si el dato ya existe en el contexto.",
+    "No inventes horarios; usa herramientas.",
+    "No confirmes reserva sin sport+date+time+name.",
+    "No repitas confirmaciones ni ofrezcas horarios si ya hay reserva confirmada, salvo que el usuario pida otra reserva explícitamente.",
+    "Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.",
+    "Para retas, NUNCA inscribas sin elección explícita del evento cuando haya más de una opción.",
+    "Para retas usa event_id = _id devuelto por get_retas (no uses ID corto).",
+    "Si ya hay un evento de reta seleccionado y el usuario confirma con 'sí' o intención de inscribirse, ejecuta confirmación inmediatamente; no vuelvas a preguntar lo mismo.",
+    "Evita repetir la misma pregunta en turnos consecutivos; avanza el flujo."
+  ],
+  toolUsage: [
+    "get_hours(sport, date): cuando tengas deporte+fecha.",
+    "confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.",
+    "get_user(phone): cuando falte nombre.",
+    "get_retas(query_text?): cuando pidan retas/americana o quieran inscribirse.",
+    "confirm_reta_user(event_id, user_id): cuando el usuario existe y eligió reta explícitamente.",
+    "confirm_reta_guest(event_id, name, last_name, phone): cuando NO existe usuario y ya diste nombre completo."
+  ],
+  responseFormat: [
+    "Máximo 2 frases.",
+    "Natural, sin sonar robótica.",
+    "Varía redacción y evita plantillas repetidas.",
+    "Si falta un dato, pide solo ese dato.",
+    "Si todo está completo y confirmado por el usuario, procede con confirm_booking."
+  ],
+  courtesyPhrases: [
+    "gracias",
+    "muchas gracias",
+    "mil gracias",
+    "ok",
+    "okei",
+    "vale",
+    "perfecto",
+    "super",
+    "genial",
+    "listo"
+  ],
+  retaSignupRegex: /\b(si|sii|sip|si\s+por\s+favor|por\s+favor|inscrib|registr|anot|apunt)\b/
+};
+
 export function init(dependencies = {}) {
   deps = dependencies;
   openai = deps.openai;
@@ -560,33 +602,6 @@ const suggestClosestHours = (hours, desiredTime) => {
   return [...new Set(suggestions)].slice(0, config.maxButtons);
 };
 
-const isGreeting = text =>
-  /\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|hey|que\s+tal)\b/i.test(text || "");
-
-const hasBookingIntent = text =>
-  /\b(reservar|reserva|resev|resevar|reserbar|agendar|agenda|apart(ar)?|cancha|horario|jugar|juego|jugará)\b/i.test(text || "");
-
-const isYes = text => /\b(s[ií]|ok|vale|confirmo|confirmar|de acuerdo|adelante|por favor|porfa)\b/i.test(text || "");
-const isNo = text => /\b(no|cancelar|mejor no|todav[ií]a no)\b/i.test(text || "");
-
-const wantsOtherTimes = text =>
-  /\b(otra\s+hora|otras\s+horas|que\s+otra|qué\s+otra|opciones|alternativas|diferente|más\s+tarde|mas\s+tarde|más\s+temprano|mas\s+temprano)\b/i.test(
-    text || ""
-  );
-
-const wantsAvailability = text =>
-  /\b(horarios|disponibilidad|disponible|espacios|que\s+horarios)\b/i.test(text || "");
-
-const isInfoQuestion = text =>
-  /\b(que\s+pasa|qué\s+pasa|llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|politica|política|regla|cancel|reagend|reembolso|devolucion|precio|costo|tarifa|ubicacion|ubicación|direccion|dirección|estacionamiento|clases|torneos|renta|rentar)\b/i.test(
-    text || ""
-  );
-
-const isNameQuestion = text => /\b(como\s+te\s+llamas|cual\s+es\s+tu\s+nombre|quien\s+eres)\b/i.test(text || "");
-
-const isLateQuestion = text =>
-  /\b(llego\s+tarde|llegar\s+tarde|se\s+me\s+hace\s+tarde|voy\s+a\s+llegar\s+tarde)\b/i.test(text || "");
-
 async function logEvent(type, payload = {}) {
   const ev = { type, payload, ts: new Date().toISOString() };
   try {
@@ -794,19 +809,7 @@ function isCourtesyOnlyMessage(text) {
 
   if (!normalized) return false;
 
-  return [
-    "gracias",
-    "muchas gracias",
-    "mil gracias",
-    "gracias!",
-    "ok",
-    "okei",
-    "vale",
-    "perfecto",
-    "super",
-    "genial",
-    "listo"
-  ].includes(normalized);
+  return AGENT_POLICY.courtesyPhrases.includes(normalized);
 }
 
 function buildCourtesyReply(session) {
@@ -834,7 +837,7 @@ function getSelectedReta(session) {
 
 function hasRetaSignupIntent(text) {
   const t = normalizeText(text || "");
-  return /\b(si|sii|sip|si por favor|por favor|inscrib|registr|anot|apunt)\b/.test(t);
+  return AGENT_POLICY.retaSignupRegex.test(t);
 }
 
 function resolveRetaSelectionFromText(text, session) {
@@ -1441,23 +1444,10 @@ DATOS DEL CLUB
 - Hoy: ${dateStr}.
 
 REGLAS CRÍTICAS
-1) No repitas preguntas si el dato ya existe en el contexto.
-2) No inventes horarios; usa herramientas.
-3) No confirmes reserva sin sport+date+time+name.
-4) No repitas confirmaciones ni ofrezcas horarios si ya hay reserva confirmada, salvo que el usuario pida otra reserva explícitamente.
-5) Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.
-6) Para retas, NUNCA inscribas sin elección explícita del evento cuando haya más de una opción.
-7) Para retas usa event_id = _id devuelto por get_retas (no uses ID corto).
-8) Si ya hay un evento de reta seleccionado y el usuario confirma con "sí" o intención de inscribirse, ejecuta confirmación inmediatamente; no vuelvas a preguntar lo mismo.
-9) Evita repetir la misma pregunta en turnos consecutivos; avanza el flujo.
+${AGENT_POLICY.criticalRules.map((rule, index) => `${index + 1}) ${rule}`).join("\n")}
 
 USO DE HERRAMIENTAS
-- get_hours(sport, date): cuando tengas deporte+fecha.
-- confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.
-- get_user(phone): cuando falte nombre.
-- get_retas(query_text?): cuando pidan retas/americana o quieran inscribirse.
-- confirm_reta_user(event_id, user_id): cuando el usuario existe y eligió reta explícitamente.
-- confirm_reta_guest(event_id, name, last_name, phone): cuando NO existe usuario y ya diste nombre completo.
+${AGENT_POLICY.toolUsage.map(item => `- ${item}`).join("\n")}
 
 CONTRATOS DE RESPUESTA DE TOOLS
 ${Object.entries(TOOL_RESPONSE_EXPECTATIONS)
@@ -1477,11 +1467,7 @@ ${confirmedBookings.map(b => `- ${b.sport} el ${formatDateEs(b.date)} a las ${b.
 ` : ""}
 
 FORMATO DE RESPUESTA
-- Máximo 2 frases.
-- Natural, sin sonar robótica.
-- Varía redacción y evita plantillas repetidas.
-- Si falta un dato, pide solo ese dato.
-- Si todo está completo y confirmado por el usuario, procede con confirm_booking.`;
+${AGENT_POLICY.responseFormat.map(item => `- ${item}`).join("\n")}`;
 
   // Build messages array with full conversation history from session
   let historyForModel = (session?.messages || [])
