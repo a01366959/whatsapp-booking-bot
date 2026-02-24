@@ -718,6 +718,36 @@ function inferAmbiguousTime(text, session) {
   return `${String(assumedHour).padStart(2, "0")}:00`;
 }
 
+function isCourtesyOnlyMessage(text) {
+  const normalized = normalizeText(text || "")
+    .toLowerCase()
+    .replace(/[!?.,;:¡¿]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return false;
+
+  return [
+    "gracias",
+    "muchas gracias",
+    "mil gracias",
+    "gracias!",
+    "ok",
+    "okei",
+    "vale",
+    "perfecto",
+    "super",
+    "genial",
+    "listo"
+  ].includes(normalized);
+}
+
+function buildCourtesyReply(session) {
+  const name = session?.user?.name || session?.bookingDraft?.name || "";
+  const suffix = name ? `, ${name}` : "";
+  return `¡Con gusto${suffix}! Aquí estoy si necesitas algo más.`;
+}
+
 /**
  * Get conversation history for context-aware responses
  * Retrieves last N messages from human_monitor conversation log
@@ -1378,6 +1408,16 @@ async function handleWhatsApp(event) {
       obsLog("time_inferred", { traceId, phone: phone.slice(-4), inferredTime, source: "ambiguous_hour_today" });
       await incrementMetric("time_inferred_ambiguous_hour");
     }
+  }
+
+  if (isCourtesyOnlyMessage(text)) {
+    const courtesyReply = buildCourtesyReply(session);
+    session.messages.push({ role: "assistant", content: courtesyReply });
+    await safeSendText(phone, courtesyReply, flowToken);
+    await saveSession(phone, session);
+    await incrementMetric("courtesy_message_short_circuit");
+    obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "courtesy_short_circuit" });
+    return { actions: [] };
   }
 
   // AI orchestrates everything from this point

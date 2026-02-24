@@ -232,3 +232,66 @@ test("includes confirmed bookings in prompt for post-booking questions", async (
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /torneos|retas/i);
 });
+
+test("courtesy thanks does not re-trigger booking flow", async () => {
+  const redis = new RedisMock();
+
+  const confirmed = [{
+    sport: "Padel",
+    date: "2026-02-24",
+    time: "17:00",
+    name: "Pablo",
+    lastName: "Escalante",
+    confirmedAt: "2026-02-24T20:00:00.000Z",
+    status: "confirmed"
+  }];
+
+  await redis.set("session:5512345678", buildSession({
+    user: { found: true, name: "Pablo", last_name: "Escalante" },
+    userChecked: true,
+    confirmedBookings: confirmed,
+    messages: [
+      { role: "assistant", content: "¡Reserva confirmada!" }
+    ]
+  }));
+  await redis.set("bookings:5512345678", confirmed);
+
+  let openAICalls = 0;
+  const openai = createOpenAIStub(async () => {
+    openAICalls += 1;
+    return {
+      choices: [
+        {
+          message: {
+            content: "No debería ejecutarse",
+            tool_calls: []
+          }
+        }
+      ]
+    };
+  });
+
+  const sent = [];
+  const { handleIncoming } = init({
+    openai,
+    redis,
+    senders: { text: async (to, text) => sent.push({ to, text }) },
+    config: {}
+  });
+
+  await handleIncoming({
+    channel: "whatsapp",
+    phone: "5512345678",
+    raw: {
+      id: "msg_gracias_1",
+      from: "5215512345678",
+      timestamp: String(Math.floor(Date.now() / 1000)),
+      type: "text",
+      text: { body: "gracias" }
+    }
+  });
+
+  assert.equal(openAICalls, 0);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /con gusto|aqui estoy/i);
+});
