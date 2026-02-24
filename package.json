@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/**/*.test.js"
+    "test": "node --test tests/**/*.test.js",
+    "sync:agent-doc": "node scripts/sync-agent-doc.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.28.0",

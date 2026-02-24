@@ -84,3 +84,17 @@ ANTI-PATTERNS TO AVOID
 - Channel-specific hacks
 - Silent failures or hidden side effects
 - Over-reliance on the LLM for deterministic logic
+
+<!-- AUTO_STATE:START -->
+## Runtime Current State (Auto-generated)
+- Generated at: 2026-02-24T20:00:00.000Z
+- Message burst hold default (ms): 1200
+- Registered tools:
+- get_user
+- get_hours
+- confirm_booking
+- Tool response contracts:
+- get_user: success="User found: <name>" | empty="User not found" | behavior="If user exists, personalize and avoid re-asking name."
+- get_hours: success="Available times for <sport> on <date>: HH:00, HH:00" | empty="No availability for <sport> on <date>" | behavior="If times exist, ask user to choose one specific time."
+- confirm_booking: success="Booking confirmed! <sport> on <date> at <time> for <name>" | empty="Cannot confirm: missing sport, date, time, or name" | behavior="After success, acknowledge confirmation and do not re-confirm same booking."
+<!-- AUTO_STATE:END -->

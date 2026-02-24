@@ -160,6 +160,24 @@ const TOOLS = [
   }
 ];
 
+const TOOL_RESPONSE_EXPECTATIONS = {
+  get_user: {
+    success: "User found: <name>",
+    empty: "User not found",
+    behavior: "If user exists, personalize and avoid re-asking name."
+  },
+  get_hours: {
+    success: "Available times for <sport> on <date>: HH:00, HH:00",
+    empty: "No availability for <sport> on <date>",
+    behavior: "If times exist, ask user to choose one specific time."
+  },
+  confirm_booking: {
+    success: "Booking confirmed! <sport> on <date> at <time> for <name>",
+    empty: "Cannot confirm: missing sport, date, time, or name",
+    behavior: "After success, acknowledge confirmation and do not re-confirm same booking."
+  }
+};
+
 export function init(dependencies = {}) {
   deps = dependencies;
   openai = deps.openai;
@@ -174,6 +192,7 @@ export function init(dependencies = {}) {
     maxButtons: Number(deps.config?.maxButtons || 3),
     mexicoTz: deps.config?.mexicoTz || "America/Mexico_City",
     useAgent: deps.config?.useAgent !== undefined ? Boolean(deps.config.useAgent) : true,
+    messageBurstHoldMs: Number(deps.config?.messageBurstHoldMs || process.env.MESSAGE_BURST_HOLD_MS || 1200),
     staffPhone: deps.config?.staffPhone,
     bubbleArchiveUrl: deps.config?.bubbleArchiveUrl,
     escalationWebhook: deps.config?.escalationWebhook
@@ -580,6 +599,10 @@ const getSession = phone => redis?.get ? redis.get(`session:${phone}`) : null;
 const saveSession = (phone, session) =>
   redis?.set ? redis.set(`session:${phone}`, session, { ex: 1800 }) : Promise.resolve();
 const clearSession = phone => (redis?.del ? redis.del(`session:${phone}`) : Promise.resolve());
+const getBurstState = phone => (redis?.get ? redis.get(`burst:${phone}`) : null);
+const saveBurstState = (phone, burst) =>
+  redis?.set ? redis.set(`burst:${phone}`, burst, { ex: 15 }) : Promise.resolve();
+const clearBurstState = phone => (redis?.del ? redis.del(`burst:${phone}`) : Promise.resolve());
 const CONFIRMED_BOOKINGS_TTL_SECONDS = 30 * 24 * 60 * 60;
 const getConfirmedBookings = phone => (redis?.get ? redis.get(`bookings:${phone}`) : []);
 const saveConfirmedBookings = (phone, bookings) =>
@@ -622,6 +645,77 @@ async function addConfirmedBooking(phone, session, booking) {
 
   session.confirmedBookings = merged;
   await saveConfirmedBookings(phone, merged);
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function coalesceBurstMessage(phone, incoming, holdMs) {
+  const now = Date.now();
+  const current = (await getBurstState(phone)) || { latestMsgId: null, items: [] };
+  const seen = new Set((current.items || []).map(item => item.msgId));
+  const nextItems = [...(current.items || [])];
+  if (!seen.has(incoming.msgId)) {
+    nextItems.push({
+      msgId: incoming.msgId,
+      text: incoming.text,
+      ts: incoming.ts || now,
+      createdAt: now
+    });
+  }
+
+  await saveBurstState(phone, {
+    latestMsgId: incoming.msgId,
+    items: nextItems,
+    updatedAt: now
+  });
+
+  await sleep(Math.max(0, holdMs));
+
+  const finalState = await getBurstState(phone);
+  if (!finalState || finalState.latestMsgId !== incoming.msgId) {
+    return null;
+  }
+
+  const mergedText = (finalState.items || [])
+    .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+    .map(item => item.text)
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+  await clearBurstState(phone);
+  return mergedText || incoming.text;
+}
+
+function parseAmbiguousHour(text) {
+  const normalized = normalizeText(text || "").trim();
+  if (!normalized) return null;
+  if (normalized.includes(":")) return null;
+  if (/\b(am|pm|manana|mañana|noche|tarde|mediodia|medio\s*dia)\b/.test(normalized)) return null;
+  const match = normalized.match(/^(?:a\s*las\s*)?(\d{1,2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  if (!Number.isFinite(hour) || hour < 1 || hour > 12) return null;
+  return hour;
+}
+
+function inferAmbiguousTime(text, session) {
+  const hour = parseAmbiguousHour(text);
+  if (hour === null) return null;
+
+  const { dateStr, hour: nowHour } = getMexicoDateParts();
+  const bookingDate = session?.bookingDraft?.date || null;
+  const historyText = normalizeText(session?.messages?.map(m => m.content).join(" ") || "");
+  const currentText = normalizeText(text || "");
+  const isTodayContext = bookingDate === dateStr || /\bhoy\b/i.test(`${historyText} ${currentText}`);
+  if (!isTodayContext) return null;
+
+  let assumedHour = hour;
+  if (hour < nowHour && hour + 12 <= 23) {
+    assumedHour = hour + 12;
+  }
+
+  return `${String(assumedHour).padStart(2, "0")}:00`;
 }
 
 /**
@@ -1058,6 +1152,11 @@ USO DE HERRAMIENTAS
 - confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.
 - get_user(phone): cuando falte nombre.
 
+CONTRATOS DE RESPUESTA DE TOOLS
+${Object.entries(TOOL_RESPONSE_EXPECTATIONS)
+  .map(([toolName, spec]) => `- ${toolName}: success="${spec.success}" | empty="${spec.empty}" | behavior="${spec.behavior}"`)
+  .join("\n")}
+
 ESTADO ACTUAL
 - bookingDraft: ${JSON.stringify(sessionContext?.bookingDraft || {}, null, 2)}
 - user_name: ${sessionContext?.user_name || "null"}
@@ -1145,7 +1244,7 @@ async function handleWhatsApp(event) {
   const phone = normalizePhone(msg.from || event.phone || "");
   if (!phone) return { actions: [] };
 
-  const text =
+  const inboundText =
     msg.text?.body ||
     msg.button?.text ||
     msg.interactive?.button_reply?.title ||
@@ -1154,7 +1253,7 @@ async function handleWhatsApp(event) {
     msg.interactive?.list_reply?.id ||
     event.text ||
     "";
-  const trimmedText = text.trim();
+  const trimmedText = inboundText.trim();
   if (!trimmedText) {
     await incrementMetric("ignored_empty_message");
     obsLog("message_ignored", { traceId, reason: "empty_text", phone: phone.slice(-4) });
@@ -1170,9 +1269,20 @@ async function handleWhatsApp(event) {
     logger?.info?.(`[FILTER] Ignoring ${msgType} from ${phone.slice(-4)}`);
     return { actions: [] };
   }
-  const normalizedText = trimmedText.toLowerCase();
-  const cleanText = normalizeText(trimmedText);
   const msgTs = Number(msg.timestamp || event.ts || 0);
+
+  const mergedText = await coalesceBurstMessage(
+    phone,
+    { msgId: msgId || randomUUID(), text: trimmedText, ts: msgTs || Date.now() },
+    config.messageBurstHoldMs
+  );
+  if (!mergedText) {
+    await incrementMetric("burst_merged_skipped");
+    obsLog("burst_merged_skip", { traceId, phone: phone.slice(-4), msgId: msgId ? String(msgId).slice(-8) : null });
+    return { actions: [] };
+  }
+  const text = mergedText;
+  const normalizedText = text.toLowerCase();
 
   // Log user message in conversation history
   if (text) {
@@ -1253,6 +1363,22 @@ async function handleWhatsApp(event) {
   // Add user message to conversation history for AI context
   session.messages = session.messages || [];
   session.messages.push({ role: "user", content: text });
+
+  if (!session.bookingDraft) {
+    session.bookingDraft = { sport: null, date: null, time: null, duration: 1, name: null, lastName: null };
+  }
+  if (!session.bookingDraft.date && /\bhoy\b/i.test(normalizeText(text))) {
+    const { dateStr } = getMexicoDateParts();
+    session.bookingDraft.date = dateStr;
+  }
+  if (!session.bookingDraft.time) {
+    const inferredTime = inferAmbiguousTime(text, session);
+    if (inferredTime) {
+      session.bookingDraft.time = inferredTime;
+      obsLog("time_inferred", { traceId, phone: phone.slice(-4), inferredTime, source: "ambiguous_hour_today" });
+      await incrementMetric("time_inferred_ambiguous_hour");
+    }
+  }
 
   // AI orchestrates everything from this point
   const decideStartedAt = Date.now();
