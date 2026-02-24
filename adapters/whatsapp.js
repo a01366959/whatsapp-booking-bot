@@ -26,6 +26,7 @@ export function createWhatsAppAdapter({ agentCore }) {
 
   async function handleWebhook(req, res) {
     try {
+      const requestId = req.headers?.["x-request-id"] || req.headers?.["x-correlation-id"] || `wa_${Date.now()}`;
       const entry = req.body.entry?.[0]?.changes?.[0]?.value;
       const msg = entry?.messages?.[0];
       if (!msg) return res.sendStatus(200);
@@ -50,7 +51,14 @@ export function createWhatsAppAdapter({ agentCore }) {
       const cleanText = text.trim();
       if (!hasSupportedType || !cleanText) return res.sendStatus(200);
 
-      console.log(`[WhatsApp Adapter] Processing ${msgType} from ${phone.slice(-4)} | Text: "${cleanText.substring(0, 50)}..."`);
+      console.log("[WhatsApp Adapter]", {
+        event: "incoming",
+        requestId,
+        msgType: msgType || "text",
+        phone: phone.slice(-4),
+        msgId: msg.id ? String(msg.id).slice(-8) : null,
+        textPreview: cleanText.substring(0, 50)
+      });
 
       const event = {
         channel: "whatsapp",
@@ -59,7 +67,7 @@ export function createWhatsAppAdapter({ agentCore }) {
         raw: msg,
         msgId: msg.id,
         ts: Number(msg.timestamp || 0),
-        meta: { entry, messageType: msgType || "text" }
+        meta: { entry, messageType: msgType || "text", requestId }
       };
 
       await agentCore.handleIncoming(event);

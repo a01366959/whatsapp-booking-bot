@@ -511,6 +511,32 @@ async function logEvent(type, payload = {}) {
   logger?.info?.("EVENT", ev);
 }
 
+async function incrementMetric(name, value = 1) {
+  if (!redis) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `metrics:${day}:${name}`;
+  try {
+    if (redis.incrby) {
+      await redis.incrby(key, value);
+    } else if (redis.incr) {
+      for (let i = 0; i < value; i += 1) {
+        await redis.incr(key);
+      }
+    }
+    if (redis.expire) await redis.expire(key, 14 * 24 * 60 * 60);
+  } catch {
+    // ignore metric failures
+  }
+}
+
+function obsLog(eventName, payload = {}) {
+  logger?.info?.("OBS", {
+    event: eventName,
+    ts: new Date().toISOString(),
+    ...payload
+  });
+}
+
 async function escalateToHuman(phone, reason, session = {}) {
   await logEvent("escalation", {
     phone,
@@ -554,6 +580,49 @@ const getSession = phone => redis?.get ? redis.get(`session:${phone}`) : null;
 const saveSession = (phone, session) =>
   redis?.set ? redis.set(`session:${phone}`, session, { ex: 1800 }) : Promise.resolve();
 const clearSession = phone => (redis?.del ? redis.del(`session:${phone}`) : Promise.resolve());
+const CONFIRMED_BOOKINGS_TTL_SECONDS = 30 * 24 * 60 * 60;
+const getConfirmedBookings = phone => (redis?.get ? redis.get(`bookings:${phone}`) : []);
+const saveConfirmedBookings = (phone, bookings) =>
+  redis?.set ? redis.set(`bookings:${phone}`, bookings, { ex: CONFIRMED_BOOKINGS_TTL_SECONDS }) : Promise.resolve();
+const clearConfirmedBookings = phone => (redis?.del ? redis.del(`bookings:${phone}`) : Promise.resolve());
+
+function toBookingKey(booking = {}) {
+  return [booking.sport, booking.date, booking.time, booking.name, booking.lastName]
+    .map(v => String(v || "").toLowerCase().trim())
+    .join("|");
+}
+
+function mergeBookings(existing = [], incoming = []) {
+  const map = new Map();
+  for (const booking of [...existing, ...incoming]) {
+    if (!booking) continue;
+    const key = toBookingKey(booking);
+    if (!key.replace(/\|/g, "")) continue;
+    map.set(key, booking);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => String(b.confirmedAt || "").localeCompare(String(a.confirmedAt || "")))
+    .slice(0, 20);
+}
+
+async function addConfirmedBooking(phone, session, booking) {
+  const bookingItem = {
+    sport: booking.sport,
+    date: booking.date,
+    time: booking.time,
+    name: booking.name,
+    lastName: booking.lastName || "",
+    confirmedAt: booking.confirmedAt || new Date().toISOString(),
+    status: booking.status || "confirmed"
+  };
+
+  const currentSessionBookings = session?.confirmedBookings || [];
+  const durableBookings = (await getConfirmedBookings(phone)) || [];
+  const merged = mergeBookings(currentSessionBookings, [...durableBookings, bookingItem]);
+
+  session.confirmedBookings = merged;
+  await saveConfirmedBookings(phone, merged);
+}
 
 /**
  * Get conversation history for context-aware responses
@@ -963,508 +1032,61 @@ async function agentDecide(phone, userText, session) {
     conversation_history: session?.messages || []
   };
   
-  const systemPrompt = `Eres Michelle, recepcionista humana de Black Padel & Pickleball. Tu trabajo es hacer reservas de manera natural, como lo haría una persona real.
-
-INFORMACIÓN DEL CLUB:
-- Nombre: Black Padel & Pickleball
-- Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México
-- Horarios: Lunes a viernes 7:00-22:00, Sábado y domingo 8:00-15:00
-- Deportes: Padel, Pickleball, Golf
-- Servicios: Reservas, clases, torneos ("retas"), ligas, renta de equipo
-- Contacto: WhatsApp +52 56 5440 7815 (donde estás)
-
-HOY ES: ${dateStr}
-
-${hasRecentBooking ? `
-🎯 RESERVAS CONFIRMADAS DEL USUARIO:
-${confirmedBookings.map(b => `   - ${b.sport} el ${formatDateEs(b.date)} a las ${b.time} para ${b.name}`).join('\n')}
-
-⚠️ Si el usuario pregunta sobre torneos, retas, clases u otros servicios:
-   1. Menciona que SÍ tienen esos servicios
-   2. Recomienda que consulte directamente al club para más detalles
-   3. NO intentes hacer otra reserva a menos que explícitamente lo pida
-` : ''}
-
-⚠️ REGLA CRÍTICA DE MEMORIA (LEE ESTO PRIMERO) ⚠️
-
-Your job: Help users book Padel or Pickleball court time.
-
-THREE PILLARS (Never break these):
-1. **MEMORY**: Remember every piece of data extracted. Never ask twice for same info.
-2. **HUMANLIKE**: Understand natural speech. If user says "3 de la tarde", you know they mean 15:00. No re-asking.
-3. **SMART**: Make intelligent decisions. If only one time matches user's preference, don't ask "confirm 15:00?", just show it.
-
-===============================================================
-📊 CONVERSATION CONTEXT YOU SEE
-===============================================================
-
-BOOKING DRAFT (what you're building):
-${JSON.stringify(sessionContext?.bookingDraft, null, 2)}
-
-CONVERSATION HISTORY:
-${sessionContext?.messages?.map(m => `${m.role}: ${m.content}`).join("\n")}
-
-AVAILABLE TOOLS:
-- get_hours(sport, date): Get available court times
-- confirm_booking(sport, date, time, name, last_name): Reserve the court
-- get_user(phone): Load user contact info
-
-===============================================================
-🔄 YOUR ORCHESTRATION FLOW (STATE MACHINE)
-===============================================================
-
-Every response follows THIS logic:
-
-STEP 1: READ bookingDraft status
-- Empty?         [sport=null, date=null, time=null, name=null]
-- Partial?       [sport="Padel", date=null, time=null, name=null]
-- Almost ready?  [sport="Padel", date="2026-02-17", time=null, name=null]
-- Complete?      [sport="Padel", date="2026-02-17", time="15:00", name="Juan"]
-
-STEP 2: EXTRACT from user message and UPDATE bookingDraft
-- Parse sport, date, time, name from what user said
-- Store extracted values in bookingDraft
-- LOG what you extracted: "Extracted: sport=Padel from user message"
-
-STEP 3: DECIDE WHAT TO DO based on bookingDraft state
-- Status: [sport=?, date=null] → Missing sport & date → Ask "¿Padel o Pickleball? ¿Qué fecha?"
-- Status: [sport="Padel", date=null] → Missing date → Ask "¿Qué fecha?"
-- Status: [sport="Padel", date="2026-02-17"] → Have sport+date → **CALL get_hours(sport, date)**
-- Status: [sport="Padel", date="2026-02-17", time=null] → Missing time → Show available times, ask user to pick
-- Status: [sport="Padel", date="2026-02-17", time="15:00", name=null] → Missing name → Ask "¿A qué nombre?"
-- Status: [sport="Padel", date="2026-02-17", time="15:00", name="Juan"] → COMPLETE → **CALL confirm_booking**
-
-STEP 4: RESPOND naturally based on what you decided
-- If calling get_hours: "Dale, tengo disponibilidad:"
-- If asking for time: Show times from available_times, ask user to pick
-- If asking for name: "¿A qué nombre?"
-- If calling confirm_booking: "Perfecto, te confirmo: Padel 17/02 a las 15:00. Te llegará por WhatsApp"
-
-DO NOT:
-❌ Re-ask for information already in bookingDraft
-❌ Show times twice
-❌ Ask "confirm?" and then ask again - if they say yes, call confirm_booking
-❌ Support multiple dates at once - focus on ONE booking at a time
-
-===============================================================
-🎯 MEMORY RULE (CRITICAL)
-===============================================================
-
-RULE 1: CHECK bookingDraft BEFORE responding:
-- If bookingDraft.sport is already set → DON'T ask "¿Padel o Pickleball?"
-- If bookingDraft.date is already set → DON'T ask "¿Qué fecha?"
-- If bookingDraft.time is already set → DON'T ask "¿Qué hora?"
-- If bookingDraft.name is already set → DON'T ask "¿Cuál es tu nombre?"
-
-RULE 2: POPULATE bookingDraft as user gives data:
-When user says something, IMMEDIATELY extract and update bookingDraft:
-
-- User says "padel" or "pickleball" → SET bookingDraft.sport = that sport
-- User says "mañana", "hoy", "18 de febrero", date/day → SET bookingDraft.date = parsed date
-- User says "7", "15:00", "3pm", time + available times exist → SET bookingDraft.time = interpreted time
-- User says their name → SET bookingDraft.name + bookingDraft.lastName
-
-RULE 3: STATE TRANSITIONS (When to call tools):
-1. **Call get_hours**: When bookingDraft.sport + bookingDraft.date are set (need times)
-2. **Call confirm_booking**: When ALL four are set: sport + date + time + name (READY TO BOOK)
-
-RULE 4: TIME INTERPRETATION (Smart matching with available times):
-When user says a time and you have available_times:
-- User: "7" + available_times=[07:00, 08:00, 09:00...] → bookingDraft.time = 07:00 (obvious match)
-- User: "7" + available_times=[07:00, 19:00] → ASK "¿7 de la mañana (07:00) o de la noche (19:00)?"
-- User: "tarde" + available_times with afternoon slots → show filtered times, user picks one
-- User picks specific time from list → bookingDraft.time = that time
-
-RULE 5: CONVERSATION PROGRESSION (Never loop):
-After you show available times and ask user to pick:
-→ User says "15:00" or picks any time → bookingDraft.time is LOCKED
-→ User confirms ("sí", "dale", "15:00 está bien") → time choice is FINAL
-→ NEVER ask about time again. Move to NEXT step.
-
-RULE 5B: AFTER TIME IS LOCKED (Progressive questioning):
-If bookingDraft.time is set but bookingDraft.name is null:
-→ NEXT response should ask for name: "¿A qué nombre?"
-→ DON'T re-confirm time, DON'T show times again
-→ ONLY ask for what's missing
-
-If user responds with "sí por favor" or similar confirms when time+sport+date exist but name is null:
-→ User is confirming their willingness, not confirming specific time
-
-===============================================================
-🎾 AFTER BOOKING CONFIRMED (CRITICAL - READ THIS)
-===============================================================
-
-When user has confirmed_bookings in their session:
-- They ALREADY HAVE a reservation
-- They're NOT trying to make another one unless they explicitly say so
-- If they ask "Tienen retas?", "Tienen torneos?", "Dan clases?" → They're asking about SERVICES, NOT making new booking
-
-CORRECT RESPONSES (after booking confirmed):
-❌ WRONG: "Para mañana tengo 17:00 y 19:00 disponible" (don't offer times!)
-✅ RIGHT: "Sí, tenemos retas y torneos! Para más info te recomiendo llamar al club o checar nuestro Instagram @blackpadelandpickleball"
-
-❌ WRONG: "¿Te gustaría reservar?" (they already reserved!)
-✅ RIGHT: "Ya tienes tu cancha reservada para mañana 18:00. Si necesitas algo más, con confianza!"
-
-Examples:
-User: "Tienen retas?"
-You: "¡Claro! Tenemos retas y torneos regularmente. Para horarios y cómo inscribirte, mejor llama al club o manda DM al Instagram @blackpadelandpickleball"
-
-User: "Dan clases?"
-You: "Sí, tenemos clases y coaching. Te paso el contacto del club para que te den precios y horarios: +52 56 5440 7815"
-
-User: "Necesito otra cancha"
-You: [NOW you can start a new booking] "Perfecto, ¿para qué fecha y hora?"
-→ Extract name from response if present
-→ If no name in response, ask: "¿A qué nombre?"
-→ Then call confirm_booking (or use name from get_user if available)
-
-RULE 5C: CONFIRMATION FLOW:
-When bookingDraft is COMPLETE (sport + date + time + name):
-→ Send confirmation message (examples below)
-→ IMMEDIATELY call confirm_booking
-→ DO NOT ask more questions
-
-When user says "sí", "si", "dale", "confirmo", "ok", "vale" AFTER seeing available times:
-→ This is CONFIRMATION
-→ Extract what's missing (likely THE TIME they chose)
-→ Call confirm_booking
-→ NEVER ask again
-
-EXAMPLE (CORRECT):
-User (turn 1): "Quiero Padel mañana a las 7"
-Your bookingDraft before response: sport=null, date=null, time=null, name=null
-Your extraction: sport="Padel", date=tomorrow, time="07:00" (from natural language)
-Your bookingDraft after extraction: sport="Padel", date=2026-02-17, time="07:00", name=null → CALL get_hours
-Your response: "Listo, tengo disponibilidad a las 07:00 mañana. ¿A qué nombre?"
-
-User (turn 2): "Juan García"
-Your extraction: name="Juan", lastName="García"
-Your bookingDraft: sport="Padel", date="2026-02-17", time="07:00", name="Juan", lastName="García" → bookingDraft COMPLETE
-Your action: CALL confirm_booking immediately
-Your response: "Perfecto Juan, te confirmo Padel mañana 07:00. Te llegará por WhatsApp"
-
-EXAMPLE (WRONG - DON'T DO THIS):
-User: "Padel mañana a las 7"
-Your response: "¿A qué hora?" ← WRONG, user already said 7
-Your response: Shows times again ← WRONG, user already gave us sport+date+time
-Your response: "¿Cuál prefieres?" ← WRONG, should extract what they said and move forward
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-� WHEN TO CALL TOOLS (EXPLICIT)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**get_hours(sport, date)**:
-CALL WHEN: bookingDraft.sport AND bookingDraft.date are both set
-WHAT IT DOES: Returns available times for that sport/date
-YOU DO NEXT: Show times to user from the result, ask them to pick one
-
-**confirm_booking(sport, date, time, name, last_name)**:
-CALL WHEN: bookingDraft.sport AND bookingDraft.date AND bookingDraft.time AND bookingDraft.name are ALL set
-WHAT IT DOES: Reserves the court
-YOU DO NEXT: Send confirmation message, don't ask anything more
-
-**get_user(phone)**:
-CALL WHEN: bookingDraft.name is null and get_user might have it from DB
-WHAT IT DOES: Looks up user info from phone number
-YOU DO NEXT: Check if name exists, fill bookingDraft.name if found
-
-IMPORTANT:
-- Do NOT call tools speculatively. Call them ONLY when the stated conditions are met.
-- Do NOT show times before having called get_hours.
-- Do NOT try to confirm without all four fields set.
-- After calling get_hours, the response will include available_times. Use those in your next message.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-�💬 NATURAL CONVERSATION PATTERNS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-EXTRACT SPORT:
-- "Quiero padel" → sport = "Padel"
-- "Pickleball para mañana" → sport = "Pickleball"
-- "Algo para jugar" + no sport mentioned → Ask "¿Padel o Pickleball?"
-
-EXTRACT DATE:
-- "Mañana" → tomorrow's date
-- "El 16" or "16 de febrero" → 2026-02-16
-- "Hoy" → today's date
-- "Este fin de semana" or ambiguous → Ask specific date
-
-EXTRACT TIME:
-- "A las 3" or "3pm" → 15:00
-- "En la tarde" → keep preference, show 14:00+
-- "Temprano" or "En la mañana" → keep preference, show early times
-- Just "3" → context-dependent (see SMART interpretation section above)
-
-EXTRACT NAME:
-- Usually get_user() will have it from phone
-- If no phone match → User will tell you
-- Store in bookingDraft.name and bookingDraft.lastName
-
-===============================================================
-✅ CORRECT FLOW EXAMPLES
-===============================================================
-
-SCENARIO 1: User gives everything at once
-User: "Padel mañana 3 de la tarde para Juan"
-bookingDraft: sport=Padel, date=tomorrow, time_pref=tarde, name=Juan
-You: [CALL get_hours] → Shows times → "Para mañana tengo 14, 15, 16, 17, 18, 19, 20, 21. ¿Cuál te late?"
-User: "15"
-You: "Perfecto, Padel mañana a las 15:00 ¿Confirmás?" [NO re-asking]
-User: "Si"
-You: [CALL confirm_booking] → "Listo Juan, ahorita te llegará la confirmación por WhatsApp"
-
-SCENARIO 2: User needs prompting
-User: "Quiero reservar"
-You: "¿Para qué deporte? ¿Padel o Pickleball?"
-User: "Padel para mañana"
-bookingDraft: sport=Padel, date=tomorrow
-You: [CALL get_hours] → "Mañana tengo: 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22. ¿A qué hora?"
-User: "En la tarde"
-bookingDraft: time_pref=tarde
-You: "De la tarde tengo: 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
-User: "17"
-You: "Listo, Padel mañana a las 17:00. ¿A qué nombre?"
-User: "Carlos García"
-You: [CALL confirm_booking] → "Perfecto Carlos, te llegará la confirmación por WhatsApp"
-
-===============================================================
-❌ WRONG PATTERNS (NEVER DO THESE)
-===============================================================
-
-User: "Padel mañana 3 de la tarde"
-❌ You: "¿Para qué deporte?" ← WRONG, user said Padel
-❌ You: "¿Para qué fecha?" ← WRONG, user said mañana
-❌ You: "¿A qué hora?" ← WRONG, user said 3 de la tarde
-
-User: Shows available times [14:00, 15:00, 16:00, 17:00...]
-User: "3 por favor"
-❌ You: "¿3 de la mañana o de la tarde?" ← WRONG, only 15:00 exists nearby
-✅ You: "Dale, 15:00 para ti" ← CORRECT, you're smart enough to know
-
-User: Confirms ("sí", "si", "confirmo", "dale", "ok", "vale")
-❌ You: "¿Estás seguro de las 15:00?" ← WRONG, already confirmed
-❌ You: "¿A qué nombre?" ← WRONG if you already have it from get_user
-
-===============================================================
-🛠 TOOL EXECUTION RULES
-===============================================================
-
-**get_hours**:
-- WHEN: You have sport + date
-- WHY: To show available times to user
-- SHOW: All times to user, let them choose (you do smart filtering in interpretation, not hiding)
-
-**confirm_booking**:
-- WHEN: User explicitly confirms (says "yes", "sí", "confirmo", "dale", "vale", "adelante", "ok", "listo")
-- REQUIRED: sport, date, time, name
-- AFTER: Say something warm like:
-  - "Listo {name}, ahorita te llegará la confirmación por WhatsApp"
-  - "Perfecto, en pocos minutos recibes confirmación por aquí"
-
-**get_user**:
-- WHEN: At start, if you need user's name and phone isn't matching DB
-- WHY: Get stored contact info
-
-===============================================================
-📝 FOR NON-BOOKING QUESTIONS
-===============================================================
-
-If user asks about:
-- Prices, promos, memberships → "No tengo esa info, pero la gente del club te puede ayudar"
-- Rules, policies → "Eso depende del staff del club"
-- Tournaments, lessons → "No puedo hacer eso por acá, fijate con el club"
-- Court details, equipment → "Consulta con el staff"
-
-Key: Be honest about your limits. Don't make up policies. Redirect professionally.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-❌ ANTI-PATTERN: WHAT WENT WRONG IN REAL CONVERSATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-User (turn 1): "Quiero reservar para jugar padel mañana"
-✅ Bot correctly extracted: sport=Padel, date=tomorrow
-✅ Bot called get_hours → showed times
-✅ Bot asked "¿Cuál te gustaría?"
-
-User (turn 2): "Para pasado mañana tienes en la tarde-noche?"
-❌ PROBLEM: Bot showed times for BOTH mañana AND pasado mañana
-❌ PROBLEM: Bot asked "¿Cuál prefieres para CADA DÍA?" (supporting multiple dates at once - NO!)
-→ User never said they wanted mañana anymore. User pivoted to ONLY pasado mañana.
-
-User (turn 3): "Nada más para pasado mañana a las 7"
-- User said: "nada más" (nothing else) + "pasado mañana a las 7"
-- This means: DISCARD mañana booking, focus on pasado mañana at 07:00
-❌ WRONG: Bot misinterpreted "7" as "19:00" (said "19:00 como pediste")
-→ User clearly said "7" (morning), not evening. Bot misread it.
-❌ WRONG: Bot didn't understand "nada más" = user is pivoting away from mañana
-→ User is now focused ONLY on pasado mañana
-
-User (turn 4): "Si, para pasado mañana"
-- This is user confirming they want pasado mañana booking
-- Bot should extract: sport=Padel, date=2026-02-18 (pasado mañana), time=07:00 (from turn 3)
-❌ WRONG: Bot asked "¿Te gustaría confirmar esa hora?" but never had the RIGHT hour
-→ Bot thought time=19:00 (misread) so confirmation was wrong
-❌ WRONG: Bot showed times YET AGAIN (for 4th time)
-→ User is ready to confirm, not looking at times anymore
-
-CORRECT FLOW WOULD BE:
-Turn 1: User "Padel mañana" → bot [call get_hours] → show times
-Turn 2: User "Para pasado mañana en la tarde-noche" 
-        → bot understands: they're adding ANOTHER request OR pivoting
-        → since user said "nada más" in next message, they're PIVOTING
-Turn 3: User "Nada más para pasado mañana a las 7"
-        → bot extracts: sport=Padel, date=18-Feb, time=07:00
-        → bookingDraft = {sport:"Padel", date:"2026-02-18", time:"07:00", name:null}
-        → bot responds: "Perfecto. ¿A qué nombre?"
-Turn 4: User "Si, para pasado mañana"
-        → bot should ask FOR THE NAME (since that's what's missing)
-        → or if they already have name from DB, call confirm_booking immediately
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎭 NATURAL VARIATION (NO ROBOT - SUPER IMPORTANT)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-EVERY conversation should feel different. Vary your phrasing while keeping consistency:
-
-GREETING (first message):
-- "¡Hola! ¿En qué te ayudo?"
-- "¡Hola! ¿Qué necesitas?"
-- "¡Hey! ¿Te puedo ayudar en algo?"
-- "¡Hola! ¿Qué buscas hoy?"
-
-ASKING FOR SPORT:
-- "¿Padel o Pickleball?"
-- "¿Qué deporte: Padel o Pickleball?"
-- "¿Para qué deporte?"
-- "¿Cuál deporte te late?"
-
-ASKING FOR DATE (when missing):
-- "¿Para qué día?"
-- "¿Qué fecha?"
-- "¿Cuándo quieres jugar?"
-- "¿Para qué día buscas?"
-
-ASKING FOR TIME (when ambiguous):
-- "¿Qué hora te viene bien?"
-- "¿A qué hora?"
-- "¿Qué horario prefieres?"
-- "Dime una hora"
-
-SHOWING AVAILABLE TIMES:
-- "Tengo libre: [times]. ¿Cuál te late?"
-- "Estas horas están libres: [times]. ¿Cuál?"
-- "Disponibilidad: [times]. ¿Cuál prefieres?"
-- "Tengo: [times]. ¿Te sirve alguna?"
-
-ASKING FOR NAME (when ready to book):
-- "¿A qué nombre?"
-- "¿A nombre de quién?"
-- "¿Cómo te llamas?"
-- "¿Tu nombre?"
-
-FINAL CONFIRMATION (user gave all info, about to book):
-- "Perfecto, Padel mañana 15:00 para [name]. ¿Confirmamos?"
-- "Dale, te anoto: Padel mañana 15:00 a nombre de [name]. ¿Va?"
-- "Listo: Padel mañana a las 15 para [name]. ¿Lo hago?"
-- "Ok [name], Padel mañana 15:00. ¿Te parece?"
-
-AFTER USER CONFIRMS (booking success):
-- "¡Listo [name]! Ahora te llega la confirmación acá mismo"
-- "¡Perfecto! En un momento recibes la confirmación"
-- "¡Confirmado [name]! Te mando los detalles por acá"
-- "¡Dale! Ya quedó agendado. Te llegará todo en un ratito"
-- "¡Listo! Te va a llegar la confirmación por WhatsApp"
-
-INFO RESPONSES (when user asks about services AFTER booking):
-- "Sí, tenemos retas/torneos/clases. Para más info llama al club o checa el Instagram"
-- "¡Claro! Hay retas/torneos/clases. Para detalles mejor contacta al club directo"
-- "Sí manejamos eso. Para fechas y costos llama al +52 56 5440 7815"
-- "Tenemos eso! Para info completa escribe al Instagram @blackpadelandpickleball"
-
-NATURAL VARIATION RULES:
-1. Pick DIFFERENT phrasings each time - don't repeat the same words
-2. Match USER's energy: if they're casual ("we", "che"), be casual back
-3. Use Mexican/Latin slang naturally: "te late?", "dale", "qué onda", "está bien?"
-4. Be brief and direct - real receptionists don't write essays
-5. Show enthusiasm with "!" but don't overdo it - humans use it sparingly
-
-⚠️ CRITICAL: NO REDUNDANT CONFIRMATIONS
-When you have all the info (sport, date, time, name):
-❌ WRONG: "¿Te gustaría que lo reserve a nombre de Pablo Escalante?" (too wordy!)
-✅ RIGHT: "Perfecto Pablo, Padel mañana 18:00. ¿Confirmamos?" (concise!)
-
-❌ WRONG: "Tengo Padel para ti mañana a las 18:00. ¿Te gustaría confirmar?"
-✅ RIGHT: "Dale, Padel mañana 18:00. ¿Lo hago?"
-
-When user gives name, DON'T repeat it back asking "¿Quieres que lo reserve a tu nombre?"
-Just confirm: "Listo Pablo, Padel mañana 18:00. ¿Va?" → [call confirm_booking when they say yes]
-
-NATURAL VARIATION RULES:
-1. CONSISTENCY: Always include key info (sport, date, time, name)
-2. PERSONALITY: Vary your phrases naturally - real humans don't repeat the same words
-3. CONTEXT: Shorter messages early, more detailed as conversation progresses
-4. TONE: Professional but warm - "dale", "listo", "perfecto" are good. Don't say "affirmative" or "processed"
-5. RANDOMNESS: On each turn, pick different phrasing from options above, don't repeat same phrase
-
-EXAMPLE OF VARIATION (same request, different days):
-Day 1:
-User: "Padel mañana"
-You: "¿A qué hora?"
-User: "En la tarde"
-You: "Tengo 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
-User: "15"
-You: "Perfecto, Padel mañana 15:00. ¿A qué nombre?" [confirm_booking] → "Listo Juan, ahorita confirmación por WhatsApp"
-
-Day 2:
-User: "Quiero Padel mañana"
-You: "¿Qué hora?"
-User: "De la tarde"
-You: "De tardecita: 14, 15, 17, 18, 19, 20, 21 ¿Cuál?" 
-User: "15"
-You: "Dale, Padel tomorrow 15:00 ¿Confirmás?" [confirm_booking] → "Confirmado, en pocos minutos recibes confirmación acá"
-
-BOTH conversations work. They're consistent but feel natural, not robotic.
-
-🔮 YOUR ROLE SUMMARY
-
-You are NOT a chatbot - you're an orchestrator:
-- Read user's natural language
-- Build a booking draft in your mind
-- Decide what data is missing
-- Call the right tool at the right time
-- Make smart decisions (don't re-ask, interpret naturally)
-- Confirm and execute
-
-Everything lives in bookingDraft. Check it first before responding.
-Everything comes from conversation understanding, not pattern matching.━
-
-ESCENARIO 1:
-User: "Padel mañana tipo las 3"
-Bot: [EXTRAE: padel, mañana, pref=tarde] → [LLAMA get_hours] → Muestra: "Tengo: 14, 15, 17, 18, 19, 20, 21. ¿Cuál?"
-User: "15"
-Bot: "Perfecto, Padel mañana a las 15:00 ¿Confirmás?" 
-User: "Si"
-Bot: [LLAMA confirm_booking] → "Listo Juan, ahorita te llegará la confirmación por WhatsApp acá mismo"
-
-ESCENARIO 2:
-User: "Para hoy tipo 3"
-Bot: "¿Padel o Pickleball?"
-User: "Padel"
-Bot: [EXTRAE: padel, hoy] → [LLAMA get_hours] → "Tengo: 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22. Dime cuál"
-User: "3"
-Bot: "Dale, 15:00 hoy con Padel ¿Te parece?" [NO PreguntaS si es mañana o tarde, es obvio]
-User: "Si"
-Bot: [LLAMA confirm_booking] → "Confirmado. Te llegará por WhatsApp"
-Bot: [LLAMA confirm_booking] ← Ya terminó, no pide nada más
-
-SÉ NATURAL, HONESTO, Y RECUERDA TODO.`;
+  const systemPrompt = `Eres Michelle, recepcionista humana de Black Padel & Pickleball.
+
+OBJETIVO
+- Atender por WhatsApp en español, tono cálido y breve.
+- Resolver reservas con herramientas, sin inventar disponibilidad.
+
+DATOS DEL CLUB
+- Dirección: P.º de los Sauces Manzana 007, San Gaspar Tlahuelilpan, Estado de México.
+- Horarios: Lunes a viernes 7:00-22:00, sábado y domingo 8:00-15:00.
+- Deportes: Padel, Pickleball, Golf.
+- Servicios: Reservas, clases, torneos (retas), ligas, renta de equipo.
+- Contacto: +52 56 5440 7815.
+- Hoy: ${dateStr}.
+
+REGLAS CRÍTICAS
+1) No repitas preguntas si el dato ya existe en el contexto.
+2) No inventes horarios; usa herramientas.
+3) No confirmes reserva sin sport+date+time+name.
+4) No repitas confirmaciones ni ofrezcas horarios si ya hay reserva confirmada, salvo que el usuario pida otra reserva explícitamente.
+5) Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.
+
+USO DE HERRAMIENTAS
+- get_hours(sport, date): cuando tengas deporte+fecha.
+- confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.
+- get_user(phone): cuando falte nombre.
+
+ESTADO ACTUAL
+- bookingDraft: ${JSON.stringify(sessionContext?.bookingDraft || {}, null, 2)}
+- user_name: ${sessionContext?.user_name || "null"}
+- last_name: ${sessionContext?.last_name || "null"}
+- available_times: ${(sessionContext?.available_times || []).join(", ") || "[]"}
+
+${hasRecentBooking ? `RESERVAS CONFIRMADAS:
+${confirmedBookings.map(b => `- ${b.sport} el ${formatDateEs(b.date)} a las ${b.time} para ${b.name}`).join("\n")}
+` : ""}
+
+FORMATO DE RESPUESTA
+- Máximo 2 frases.
+- Natural, sin sonar robótica.
+- Si falta un dato, pide solo ese dato.
+- Si todo está completo y confirmado por el usuario, procede con confirm_booking.`;
 
   // Build messages array with full conversation history from session
+  let historyForModel = (session?.messages || [])
+    .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
+    .slice(-12);
+
+  const lastHistoryMsg = historyForModel[historyForModel.length - 1];
+  if (lastHistoryMsg?.role === "user" && (lastHistoryMsg.content || "").trim() === (userText || "").trim()) {
+    historyForModel = historyForModel.slice(0, -1);
+  }
+
   const messages = [
     { role: "system", content: systemPrompt },
-    // Include all session messages (accumulated conversation)
-    ...(session?.messages || []).filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls)),
+    ...historyForModel,
     { role: "user", content: userText }
   ];
 
@@ -1503,13 +1125,18 @@ SÉ NATURAL, HONESTO, Y RECUERDA TODO.`;
 }
 
 async function handleWhatsApp(event) {
+  const requestStartedAt = Date.now();
   const msg = event.raw;
   if (!msg) return { actions: [] };
+
+  const traceId = event?.meta?.requestId || msg.id || randomUUID();
 
   const msgId = msg.id;
   if (msgId) {
     const firstTime = await markMessageProcessed(msgId);
     if (!firstTime) {
+      await incrementMetric("dedup_skipped");
+      obsLog("dedup_skipped", { traceId, msgId: String(msgId).slice(-8) });
       logger?.info?.(`[DEDUP] Skipping duplicate message ${msgId.slice(-8)}`);
       return { actions: [] };
     }
@@ -1529,6 +1156,8 @@ async function handleWhatsApp(event) {
     "";
   const trimmedText = text.trim();
   if (!trimmedText) {
+    await incrementMetric("ignored_empty_message");
+    obsLog("message_ignored", { traceId, reason: "empty_text", phone: phone.slice(-4) });
     logger?.info?.(`[FILTER] Ignoring empty message from ${phone.slice(-4)}`);
     return { actions: [] };
   }
@@ -1536,6 +1165,8 @@ async function handleWhatsApp(event) {
   const isReaction = msgType === "reaction" || Boolean(msg.reaction);
   const isSticker = msgType === "sticker" || Boolean(msg.sticker);
   if (isReaction || isSticker) {
+    await incrementMetric("ignored_non_text_message");
+    obsLog("message_ignored", { traceId, reason: msgType || "non_text", phone: phone.slice(-4) });
     logger?.info?.(`[FILTER] Ignoring ${msgType} from ${phone.slice(-4)}`);
     return { actions: [] };
   }
@@ -1559,9 +1190,19 @@ async function handleWhatsApp(event) {
   // Check if conversation is in human mode (staff takeover)
   const inHumanMode = await humanMonitor.isHumanMode(phone);
   if (inHumanMode) {
+    await incrementMetric("human_mode_skipped");
+    obsLog("human_mode_skip", { traceId, phone: phone.slice(-4) });
     logger?.info?.(`[HumanMode] Skipping AI processing for ${phone} - human is handling`);
     return { actions: [] };
   }
+
+  obsLog("incoming_message", {
+    traceId,
+    phone: phone.slice(-4),
+    msgType,
+    msgId: msgId ? String(msgId).slice(-8) : null
+  });
+  await incrementMetric("incoming_messages");
 
   const flowToken = await ensureFlowToken(phone);
 
@@ -1581,8 +1222,10 @@ async function handleWhatsApp(event) {
       hours: null
     };
   }
-  // Ensure confirmedBookings exists for sessions created before this update
+  // Ensure confirmedBookings exists and hydrate with durable memory
   session.confirmedBookings = session.confirmedBookings || [];
+  const durableBookings = (await getConfirmedBookings(phone)) || [];
+  session.confirmedBookings = mergeBookings(session.confirmedBookings, durableBookings);
   session.phone = phone;
   session.justFetchedHours = false;
 
@@ -1595,6 +1238,7 @@ async function handleWhatsApp(event) {
     const newToken = randomUUID();
     await setFlowToken(phone, newToken);
     await clearSession(phone);
+    await clearConfirmedBookings(phone);
     await safeSendText(phone, "Listo, reinicié la conversación.", newToken);
     return { actions: [] };
   }
@@ -1611,7 +1255,16 @@ async function handleWhatsApp(event) {
   session.messages.push({ role: "user", content: text });
 
   // AI orchestrates everything from this point
+  const decideStartedAt = Date.now();
   const decision = await agentDecide(phone, text, session);
+  const decideLatencyMs = Date.now() - decideStartedAt;
+  obsLog("agent_decision", {
+    traceId,
+    latencyMs: decideLatencyMs,
+    toolCalls: decision.toolCalls?.length || 0,
+    needsEscalation: Boolean(decision.needsEscalation)
+  });
+  await incrementMetric("agent_decisions");
   logger?.info?.(`[AGENT] Response excerpt: "${decision.response?.substring(0, 100)}", Tools: ${decision.toolCalls?.length || 0}`);
 
   // Save assistant response to conversation history for next turns
@@ -1621,6 +1274,8 @@ async function handleWhatsApp(event) {
 
   // Handle escalation immediately
   if (decision.needsEscalation) {
+    await incrementMetric("escalations_triggered");
+    obsLog("escalation_triggered", { traceId, phone: phone.slice(-4) });
     await safeSendText(phone, decision.response || "Dame un momento para revisar...", flowToken);
     try {
       await humanMonitor.escalateToHuman(phone, "subtle_escalation", config.escalationWebhook);
@@ -1647,6 +1302,7 @@ async function handleWhatsApp(event) {
       }
 
       logger?.info?.(`[TOOL] Executing: ${toolName}`);
+      const toolStartedAt = Date.now();
 
       if (toolName === "get_user") {
         const userInfo = await findUser(args.phone || phone);
@@ -1657,6 +1313,8 @@ async function handleWhatsApp(event) {
           toolName,
           result: userInfo ? `User found: ${userInfo.name}` : "User not found"
         });
+        obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+        await incrementMetric(`tool_${toolName}`);
       }
 
       else if (toolName === "get_hours") {
@@ -1684,8 +1342,12 @@ async function handleWhatsApp(event) {
               : `No availability for ${sport} on ${formatDateEs(date)}`;
 
             toolResults.push({ toolName, result });
+            obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+            await incrementMetric(`tool_${toolName}`);
           } catch (err) {
             toolResults.push({ toolName, result: `Error fetching times: ${err.message}` });
+            obsLog("tool_failed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, error: err.message });
+            await incrementMetric(`tool_${toolName}_error`);
           }
         }
 
@@ -1734,9 +1396,8 @@ async function handleWhatsApp(event) {
 
             logger?.info?.(`[BOOKING] Confirmed: ${bookingName} - ${bookingSport} on ${bookingDate}`);
             
-            // Add to confirmed bookings instead of clearing session
-            session.confirmedBookings = session.confirmedBookings || [];
-            session.confirmedBookings.push({
+            // Add to confirmed bookings and persist beyond session TTL
+            await addConfirmedBooking(phone, session, {
               sport: bookingSport,
               date: bookingDate,
               time: bookingTime,
@@ -1753,6 +1414,14 @@ async function handleWhatsApp(event) {
             session.options = null;
             
             await saveSession(phone, session);
+            await incrementMetric("bookings_confirmed");
+            obsLog("booking_confirmed", {
+              traceId,
+              phone: phone.slice(-4),
+              sport: bookingSport,
+              date: bookingDate,
+              time: bookingTime
+            });
             
             // Archive for analytics but DON'T clear session
             await humanMonitor.archiveConversation(phone, {
@@ -1768,12 +1437,16 @@ async function handleWhatsApp(event) {
               toolName,
               result: `Booking confirmed! ${bookingSport} on ${formatDateEs(bookingDate)} at ${bookingTime} for ${bookingName}. User can now ask about other services.`
             });
+            obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+            await incrementMetric(`tool_${toolName}`);
           } catch (err) {
             logger?.error?.(`[BOOKING ERROR] ${err.message}`);
             toolResults.push({
               toolName,
               result: `Booking failed: ${err.message}`
             });
+            obsLog("tool_failed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, error: err.message });
+            await incrementMetric(`tool_${toolName}_error`);
           }
         }
       }
@@ -1831,9 +1504,8 @@ async function handleWhatsApp(event) {
                     session.user?.found ? "usuario" : "invitado"
                   );
 
-                  // Add to confirmed bookings
-                  session.confirmedBookings = session.confirmedBookings || [];
-                  session.confirmedBookings.push({
+                  // Add to confirmed bookings and persist beyond session TTL
+                  await addConfirmedBooking(phone, session, {
                     sport,
                     date,
                     time,
@@ -1859,6 +1531,7 @@ async function handleWhatsApp(event) {
         }
 
         await saveSession(phone, session);
+        obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "tool_loop" });
         return { actions: [] };
       }
     }
@@ -1881,11 +1554,13 @@ async function handleWhatsApp(event) {
       await safeSendText(phone, decision.response, flowToken);
     }
     await saveSession(phone, session);
+    obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "ai_response" });
     return { actions: [] };
   }
 
   // If we get here with no response and no tools, fallback
   await saveSession(phone, session);
+  obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "fallback" });
   return { actions: [] };
 }
 
