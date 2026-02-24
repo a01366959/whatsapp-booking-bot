@@ -1,6 +1,19 @@
 import axios from "axios";
 import { randomUUID } from "crypto";
 import * as humanMonitor from "./human_monitor.js";
+import { AGENT_POLICY, TOOL_RESPONSE_EXPECTATIONS } from "./agent_policy.js";
+import {
+  inferAmbiguousTime,
+  isCourtesyOnlyMessage,
+  buildCourtesyReply,
+  getSelectedReta,
+  hasRetaSignupIntent,
+  resolveRetaSelectionFromText,
+  buildSyntheticToolCall
+} from "./agent_guards.js";
+import { createAgentTools } from "./agent_tools.js";
+import { buildRuntimeConfig } from "./agent_runtime_config.js";
+import { createChannelIO } from "./channel_io.js";
 
 let deps = {};
 let openai;
@@ -8,6 +21,8 @@ let redis;
 let senders;
 let logger;
 let config;
+let toolAdapters;
+let channelIO;
 let monitorInitialized = false;
 
 const BUBBLE_REDIRECTS = new Set([301, 302, 303, 307, 308]);
@@ -212,100 +227,36 @@ const TOOLS = [
   }
 ];
 
-const TOOL_RESPONSE_EXPECTATIONS = {
-  get_user: {
-    success: "User found: <name>",
-    empty: "User not found",
-    behavior: "If user exists, personalize and avoid re-asking name."
-  },
-  get_hours: {
-    success: "Available times for <sport> on <date>: HH:00, HH:00",
-    empty: "No availability for <sport> on <date>",
-    behavior: "If times exist, ask user to choose one specific time."
-  },
-  confirm_booking: {
-    success: "Booking confirmed! <sport> on <date> at <time> for <name>",
-    empty: "Cannot confirm: missing sport, date, time, or name",
-    behavior: "After success, acknowledge confirmation and do not re-confirm same booking."
-  },
-  get_retas: {
-    success: "Active retas: [event_id=_id, name, date, mode, price]",
-    empty: "No active upcoming retas",
-    behavior: "If multiple retas match, ask user to choose one before confirming registration."
-  },
-  confirm_reta_user: {
-    success: "Reta registration confirmed for existing user",
-    empty: "Cannot register reta user: missing event_id or user_id",
-    behavior: "Use only after explicit user choice of reta event and known user_id."
-  },
-  confirm_reta_guest: {
-    success: "Reta guest registration confirmed",
-    empty: "Cannot register reta guest: missing event_id, name, last_name, or phone",
-    behavior: "Use only when user is not found and full guest name is collected."
-  }
-};
-
-const AGENT_POLICY = {
-  criticalRules: [
-    "No repitas preguntas si el dato ya existe en el contexto.",
-    "No inventes horarios; usa herramientas.",
-    "No confirmes reserva sin sport+date+time+name.",
-    "No repitas confirmaciones ni ofrezcas horarios si ya hay reserva confirmada, salvo que el usuario pida otra reserva explícitamente.",
-    "Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.",
-    "Para retas, NUNCA inscribas sin elección explícita del evento cuando haya más de una opción.",
-    "Para retas usa event_id = _id devuelto por get_retas (no uses ID corto).",
-    "Si ya hay un evento de reta seleccionado y el usuario confirma con 'sí' o intención de inscribirse, ejecuta confirmación inmediatamente; no vuelvas a preguntar lo mismo.",
-    "Evita repetir la misma pregunta en turnos consecutivos; avanza el flujo."
-  ],
-  toolUsage: [
-    "get_hours(sport, date): cuando tengas deporte+fecha.",
-    "confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.",
-    "get_user(phone): cuando falte nombre.",
-    "get_retas(query_text?): cuando pidan retas/americana o quieran inscribirse.",
-    "confirm_reta_user(event_id, user_id): cuando el usuario existe y eligió reta explícitamente.",
-    "confirm_reta_guest(event_id, name, last_name, phone): cuando NO existe usuario y ya diste nombre completo."
-  ],
-  responseFormat: [
-    "Máximo 2 frases.",
-    "Natural, sin sonar robótica.",
-    "Varía redacción y evita plantillas repetidas.",
-    "Si falta un dato, pide solo ese dato.",
-    "Si todo está completo y confirmado por el usuario, procede con confirm_booking."
-  ],
-  courtesyPhrases: [
-    "gracias",
-    "muchas gracias",
-    "mil gracias",
-    "ok",
-    "okei",
-    "vale",
-    "perfecto",
-    "super",
-    "genial",
-    "listo"
-  ],
-  retaSignupRegex: /\b(si|sii|sip|si\s+por\s+favor|por\s+favor|inscrib|registr|anot|apunt)\b/
-};
-
 export function init(dependencies = {}) {
   deps = dependencies;
   openai = deps.openai;
   redis = deps.redis;
   senders = deps.senders || {};
   logger = deps.logger || console;
+  const runtime = buildRuntimeConfig(deps.config || {}, process.env || {});
   config = {
-    bubbleBaseUrl: normalizeBubbleBase(deps.config?.bubbleBaseUrl || ""),
-    bubbleToken: deps.config?.bubbleToken || "",
-    confirmEndpoint: deps.config?.confirmEndpoint || "confirm_reserva",
-    defaultSport: deps.config?.defaultSport || "Padel",
-    maxButtons: Number(deps.config?.maxButtons || 3),
-    mexicoTz: deps.config?.mexicoTz || "America/Mexico_City",
-    useAgent: deps.config?.useAgent !== undefined ? Boolean(deps.config.useAgent) : true,
-    messageBurstHoldMs: Number(deps.config?.messageBurstHoldMs || process.env.MESSAGE_BURST_HOLD_MS || 1200),
-    staffPhone: deps.config?.staffPhone,
-    bubbleArchiveUrl: deps.config?.bubbleArchiveUrl,
-    escalationWebhook: deps.config?.escalationWebhook
+    ...runtime,
+    bubbleBaseUrl: normalizeBubbleBase(runtime.bubbleBaseUrl)
   };
+
+  toolAdapters = createAgentTools({
+    bubbleRequest,
+    normalizePhone,
+    getMexicoDateParts,
+    toBubbleDate,
+    normalizeText,
+    monthIndex: MONTH_INDEX,
+    config,
+    logger
+  });
+
+  channelIO = createChannelIO({
+    senders,
+    logger,
+    getFlowToken,
+    logEvent,
+    logMessage: (phone, message) => humanMonitor.logMessage(phone, message)
+  });
   
   // Initialize human monitoring system
   if (!monitorInitialized && redis) {
@@ -652,7 +603,7 @@ async function escalateToHuman(phone, reason, session = {}) {
   const staff = config.staffPhone || process.env.STAFF_PHONE;
   if (staff) {
     try {
-      await safeSendText(staff, `Escalation: ${phone} — ${reason}`);
+      await channelIO.safeSendText(staff, `Escalation: ${phone} — ${reason}`);
     } catch (err) {
       logger?.error?.("escalateToHuman notify staff failed", err?.message || err);
     }
@@ -769,127 +720,6 @@ async function coalesceBurstMessage(phone, incoming, holdMs) {
   return mergedText || incoming.text;
 }
 
-function parseAmbiguousHour(text) {
-  const normalized = normalizeText(text || "").trim();
-  if (!normalized) return null;
-  if (normalized.includes(":")) return null;
-  if (/\b(am|pm|manana|mañana|noche|tarde|mediodia|medio\s*dia)\b/.test(normalized)) return null;
-  const match = normalized.match(/^(?:a\s*las\s*)?(\d{1,2})$/);
-  if (!match) return null;
-  const hour = Number(match[1]);
-  if (!Number.isFinite(hour) || hour < 1 || hour > 12) return null;
-  return hour;
-}
-
-function inferAmbiguousTime(text, session) {
-  const hour = parseAmbiguousHour(text);
-  if (hour === null) return null;
-
-  const { dateStr, hour: nowHour } = getMexicoDateParts();
-  const bookingDate = session?.bookingDraft?.date || null;
-  const historyText = normalizeText(session?.messages?.map(m => m.content).join(" ") || "");
-  const currentText = normalizeText(text || "");
-  const isTodayContext = bookingDate === dateStr || /\bhoy\b/i.test(`${historyText} ${currentText}`);
-  if (!isTodayContext) return null;
-
-  let assumedHour = hour;
-  if (hour < nowHour && hour + 12 <= 23) {
-    assumedHour = hour + 12;
-  }
-
-  return `${String(assumedHour).padStart(2, "0")}:00`;
-}
-
-function isCourtesyOnlyMessage(text) {
-  const normalized = normalizeText(text || "")
-    .toLowerCase()
-    .replace(/[!?.,;:¡¿]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!normalized) return false;
-
-  return AGENT_POLICY.courtesyPhrases.includes(normalized);
-}
-
-function buildCourtesyReply(session) {
-  const name = session?.user?.name || session?.bookingDraft?.name || "";
-  const suffix = name ? `, ${name}` : "";
-  return `¡Con gusto${suffix}! Aquí estoy si necesitas algo más.`;
-}
-
-function dateKeyInMexicoFromEpoch(epochMs) {
-  if (!epochMs) return null;
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: config.mexicoTz || "America/Mexico_City",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(new Date(epochMs));
-}
-
-function getSelectedReta(session) {
-  const eventId = session?.retaDraft?.eventId;
-  const retas = Array.isArray(session?.retas) ? session.retas : [];
-  if (!eventId) return null;
-  return retas.find(r => r.eventId === eventId) || null;
-}
-
-function hasRetaSignupIntent(text) {
-  const t = normalizeText(text || "");
-  return AGENT_POLICY.retaSignupRegex.test(t);
-}
-
-function resolveRetaSelectionFromText(text, session) {
-  const retas = Array.isArray(session?.retas) ? session.retas : [];
-  if (!retas.length) return null;
-
-  const normalized = normalizeText(text || "");
-  if (!normalized) return null;
-
-  const byId = retas.find(r => normalized.includes(normalizeText(r.eventId || "")));
-  if (byId) return byId;
-
-  const ordered = [...retas].sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
-  const ordinalMap = [
-    { n: 1, rx: /\b(1|uno|primera|primer)\b/ },
-    { n: 2, rx: /\b(2|dos|segunda|segundo)\b/ },
-    { n: 3, rx: /\b(3|tres|tercera|tercero)\b/ }
-  ];
-  for (const ord of ordinalMap) {
-    if (ord.rx.test(normalized) && ordered[ord.n - 1]) return ordered[ord.n - 1];
-  }
-
-  const today = getMexicoDateParts().dateStr;
-  if (/\bhoy\b/.test(normalized)) {
-    const todayMatches = ordered.filter(r => dateKeyInMexicoFromEpoch(r.dateMs) === today);
-    if (todayMatches.length === 1) return todayMatches[0];
-  }
-
-  if (/\bmanana|mañana\b/.test(normalized)) {
-    const now = new Date(`${today}T00:00:00Z`).getTime();
-    const tomorrow = dateKeyInMexicoFromEpoch(now + 24 * 60 * 60 * 1000);
-    const tomorrowMatches = ordered.filter(r => dateKeyInMexicoFromEpoch(r.dateMs) === tomorrow);
-    if (tomorrowMatches.length === 1) return tomorrowMatches[0];
-  }
-
-  const nameMatches = ordered.filter(r => normalizeText(r.name).includes(normalized));
-  if (nameMatches.length === 1) return nameMatches[0];
-
-  return null;
-}
-
-function buildSyntheticToolCall(name, args) {
-  return {
-    id: `auto_${name}_${Date.now()}`,
-    type: "function",
-    function: {
-      name,
-      arguments: JSON.stringify(args)
-    }
-  };
-}
-
 /**
  * Get conversation history for context-aware responses
  * Retrieves last N messages from human_monitor conversation log
@@ -966,258 +796,6 @@ const ensureFlowToken = async phone => {
   return token;
 };
 
-async function safeSendText(to, text, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    if (!senders?.text) throw new Error("text sender not configured");
-    await senders.text(to, text);
-    await logEvent("send_text", { to, text });
-    
-    // Log AI message in conversation history
-    await humanMonitor.logMessage(to, {
-      sender: "ai",
-      text,
-      metadata: { type: "text" }
-    });
-    
-    return { ok: true };
-  } catch (err) {
-    logger?.error?.("sendText failed", err?.response?.data || err?.message || err);
-    await logEvent("send_text_error", { to, message: err?.message || "unknown" });
-    return { ok: false, error: "sendText_failed" };
-  }
-}
-
-async function safeSendButtons(to, text, buttons, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    if (!senders?.buttons) throw new Error("buttons sender not configured");
-    await senders.buttons(to, text, buttons);
-    await logEvent("send_buttons", { to, text, buttons });
-    return { ok: true };
-  } catch (err) {
-    logger?.error?.("sendButtons failed", err?.response?.data || err?.message || err);
-    await logEvent("send_buttons_error", { to, message: err?.message || "unknown" });
-    return { ok: false, error: "sendButtons_failed" };
-  }
-}
-
-async function safeSendLocation(to, latitude, longitude, name, address, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    if (!senders?.location) {
-      logger?.warn?.("location sender not configured, sending as text");
-      await safeSendText(to, `📍 ${name}\n${address}`, flowToken);
-      return { ok: true };
-    }
-    await senders.location(to, { latitude, longitude, name, address });
-    await logEvent("send_location", { to, name, address });
-    
-    // Log AI message in conversation history
-    await humanMonitor.logMessage(to, {
-      sender: "ai",
-      text: `📍 ${name}\n${address}`,
-      metadata: { type: "location", latitude, longitude }
-    });
-    
-    return { ok: true };
-  } catch (err) {
-    logger?.error?.("sendLocation failed", err?.response?.data || err?.message || err);
-    logger?.warn?.("falling back to text message for location");
-    await safeSendText(to, `📍 ${name}\n${address}`, flowToken);
-    return { ok: true };
-  }
-}
-
-async function safeSendList(to, bodyText, buttonText, sections, flowToken) {
-  if (!to) return { ok: false, error: "missing_to" };
-  if (flowToken) {
-    const current = await getFlowToken(to);
-    if (current && current !== flowToken) return { ok: false, error: "stale_flow" };
-  }
-  try {
-    if (!senders?.list) {
-      logger?.warn?.(`[LIST] sender not configured, falling back to text. Sections: ${sections.length}`);
-      const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
-      await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
-      return { ok: true };
-    }
-    logger?.info?.(`[LIST] Sending list with ${sections[0]?.rows?.length || 0} options to ${to}`);
-    await senders.list(to, bodyText, buttonText, sections);
-    await logEvent("send_list", { to, bodyText, sectionsCount: sections.length });
-    
-    // Log AI message in conversation history
-    const options = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
-    await humanMonitor.logMessage(to, {
-      sender: "ai",
-      text: `${bodyText}\n\nOpciones: ${options}`,
-      metadata: { type: "list", sectionsCount: sections.length }
-    });
-    
-    return { ok: true };
-  } catch (err) {
-    logger?.error?.(`[LIST] sendList failed: ${err?.message}`, err?.response?.data || err);
-    logger?.warn?.(`[LIST] falling back to text message`);
-    const allOptions = sections.flatMap(s => s.rows.map(r => r.title)).join(", ");
-    await safeSendText(to, `${bodyText}\n\n${allOptions}`, flowToken);
-    return { ok: true };
-  }
-}
-
-async function findUser(phone) {
-  const r = await bubbleRequest("get", "/get_user", { params: { phone } });
-  return r.data?.response || { found: false };
-}
-
-async function getAvailableHours(date, desiredSport) {
-  const bubbleDate = toBubbleDate(date);
-  const { hour, dateStr } = getMexicoDateParts();
-  const dateOnly = (date || "").includes("T") ? String(date).slice(0, 10) : String(date || "");
-  const currentTimeNumber = dateOnly && dateOnly === dateStr ? hour : 0;
-  const r = await bubbleRequest("get", "/get_hours", {
-    params: {
-      sport: desiredSport || config.defaultSport,
-      date: bubbleDate,
-      current_time_number: currentTimeNumber
-    }
-  });
-  return r.data?.response?.hours || [];
-}
-
-function toEpochMs(value) {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  return num > 1e12 ? num : num * 1000;
-}
-
-function formatEventDateEs(value) {
-  const epochMs = toEpochMs(value);
-  if (!epochMs) return "fecha por confirmar";
-  return new Intl.DateTimeFormat("es-MX", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: config.mexicoTz || "America/Mexico_City"
-  }).format(new Date(epochMs));
-}
-
-function normalizeRetaRecord(reta) {
-  const rawName = reta?.["Public name"] || reta?.Name || "Reta";
-  const name = String(rawName).trim();
-  const eventId = reta?._id || null;
-  const fixedPair = Boolean(reta?.["Pareja Fija"]);
-  const mode = fixedPair ? "pareja fija" : "individual";
-  return {
-    eventId,
-    name,
-    mode,
-    dateLabel: formatEventDateEs(reta?.["Date inicio"]),
-    dateMs: toEpochMs(reta?.["Date inicio"]) || 0,
-    price: reta?.price_per_event ?? null,
-    raw: reta
-  };
-}
-
-function filterRetasByIntent(retas, queryText) {
-  const normalized = normalizeText(queryText || "");
-  if (!normalized) return retas;
-
-  let filtered = [...retas];
-  if (/pareja\s+fija/.test(normalized)) {
-    filtered = filtered.filter(r => r.mode === "pareja fija");
-  } else if (/individual/.test(normalized)) {
-    filtered = filtered.filter(r => r.mode === "individual");
-  }
-
-  const monthHit = Object.entries(MONTH_INDEX).find(([monthName]) => new RegExp(`\\b${monthName}\\b`).test(normalized));
-  if (monthHit) {
-    const monthNum = monthHit[1];
-    const monthFiltered = filtered.filter(r => {
-      if (!r.dateMs) return false;
-      return new Date(r.dateMs).getUTCMonth() + 1 === monthNum;
-    });
-    if (monthFiltered.length > 0) filtered = monthFiltered;
-  }
-
-  const nameFiltered = filtered.filter(r => normalizeText(r.name).includes(normalized));
-  if (nameFiltered.length > 0) filtered = nameFiltered;
-
-  return filtered;
-}
-
-async function getRetas() {
-  const r = await bubbleRequest("get", "/get_retas");
-  const found = Boolean(r.data?.response?.found);
-  const retas = Array.isArray(r.data?.response?.retas) ? r.data.response.retas : [];
-  if (!found || retas.length === 0) return [];
-  return retas;
-}
-
-async function confirmRetaUser(eventId, userId) {
-  const body = { event: eventId, users: [userId] };
-  const r = await bubbleRequest("post", "/confirm_reta_user", { data: body });
-  return r.data?.response?.response || "ok";
-}
-
-async function confirmRetaGuest(eventId, guest) {
-  const body = {
-    event: eventId,
-    name: guest.name,
-    last_name: guest.lastName,
-    phone: normalizePhone(guest.phone)
-  };
-  const r = await bubbleRequest("post", "/confirm_reta_guest", { data: body });
-  return r.data?.response?.response || "ok";
-}
-
-async function confirmBooking(phone, date, times, court, name, lastName, userId, sport, userType) {
-  const bubbleDate = toBubbleDate(date);
-  const basePayload = {
-    phone,
-    date: bubbleDate,
-    time: times,
-    court,
-    sport: sport || config.defaultSport,
-    user_type: userType
-  };
-  if (name) basePayload.name = name;
-  if (lastName) basePayload.last_name = lastName;
-  const withUser = userId ? { ...basePayload, user: userId } : basePayload;
-  try {
-    const res = await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: withUser });
-    const apiError = res?.data?.response?.error;
-    if (apiError) {
-      const err = new Error(apiError);
-      err.code = "slot_taken";
-      throw err;
-    }
-  } catch (err) {
-    logger?.error?.("confirmBooking failed", {
-      baseURL: config.bubbleBaseUrl,
-      url: err?.config?.url,
-      method: err?.config?.method,
-      statusCode: err?.response?.status,
-      data: err?.response?.data
-    });
-    if (userId && err?.code !== "slot_taken") {
-      await bubbleRequest("post", `/${config.confirmEndpoint}`, { data: basePayload });
-      return;
-    }
-    throw err;
-  }
-}
-
 async function interpretMessage(session, userText) {
   if (!openai) return { intent: "other" };
   const { dateStr } = getMexicoDateParts();
@@ -1248,7 +826,7 @@ Hoy en México es ${dateStr}.
 
   try {
     const resp = await openai.chat.completions.create({
-      model: deps.config?.interpretModel || "gpt-4o-mini",
+      model: config.interpretModel,
       messages,
       temperature: 0.2,
       response_format: { type: "json_object" }
@@ -1299,7 +877,7 @@ IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "descono
   while (!finalText && guard < 4) {
     guard += 1;
     const response = await openai.chat.completions.create({
-      model: deps.config?.agentModel || "gpt-4o-mini",
+      model: config.agentModel,
       messages,
       tools: TOOLS,
       tool_choice: "auto",
@@ -1327,7 +905,7 @@ IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "descono
 
         let result = { ok: false };
         if (name === "get_user") {
-          result = await findUser(args.phone);
+          result = await toolAdapters.findUser(args.phone);
           session.user = result;
           if (result?.last_name) session.userLastName = result.last_name;
         } else if (name === "get_hours") {
@@ -1338,7 +916,7 @@ IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "descono
           } else {
             session.date = date;
             session.sport = sport;
-            const slots = await getAvailableHours(date, sport);
+            const slots = await toolAdapters.getAvailableHours(date, sport);
             session.slots = slots;
             session.options = buildOptions(slots, session.duration || 1);
             const times = startTimesFromOptions(session.options);
@@ -1370,7 +948,7 @@ async function agentDecide(phone, userText, session) {
   if (!openai) return { response: "¿Me repites, por favor?", toolCalls: [], needsEscalation: false };
 
   const selectedReta = getSelectedReta(session);
-  if (selectedReta && hasRetaSignupIntent(userText)) {
+  if (selectedReta && hasRetaSignupIntent(userText, normalizeText, AGENT_POLICY.retaSignupRegex)) {
     if (session?.user?.found && session?.user?.id) {
       return {
         response: "Perfecto, te inscribo ahora mismo.",
@@ -1472,7 +1050,7 @@ ${AGENT_POLICY.responseFormat.map(item => `- ${item}`).join("\n")}`;
   // Build messages array with full conversation history from session
   let historyForModel = (session?.messages || [])
     .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
-    .slice(-12);
+    .slice(-config.historyWindow);
 
   const lastHistoryMsg = historyForModel[historyForModel.length - 1];
   if (lastHistoryMsg?.role === "user" && (lastHistoryMsg.content || "").trim() === (userText || "").trim()) {
@@ -1487,13 +1065,13 @@ ${AGENT_POLICY.responseFormat.map(item => `- ${item}`).join("\n")}`;
 
   try {
     const response = await openai.chat.completions.create({
-      model: deps.config?.decideModel || "gpt-4o",
+      model: config.decideModel,
       messages,
       tools: TOOLS,
       tool_choice: "auto",  // Let AI decide when to use tools
-      temperature: 0.8,
-      presence_penalty: 0.35,
-      frequency_penalty: 0.3
+      temperature: config.decideTemperature,
+      presence_penalty: config.decidePresencePenalty,
+      frequency_penalty: config.decideFrequencyPenalty
     });
 
     const message = response.choices[0]?.message;
@@ -1651,13 +1229,13 @@ async function handleWhatsApp(event) {
     await setFlowToken(phone, newToken);
     await clearSession(phone);
     await clearConfirmedBookings(phone);
-    await safeSendText(phone, "Listo, reinicié la conversación.", newToken);
+    await channelIO.safeSendText(phone, "Listo, reinicié la conversación.", newToken);
     return { actions: [] };
   }
 
   // Get user info if not already checked
   if (!session.userChecked) {
-    session.user = await findUser(phone);
+    session.user = await toolAdapters.findUser(phone);
     if (session.user?.last_name) session.userLastName = session.user.last_name;
     session.userChecked = true;
   }
@@ -1674,7 +1252,7 @@ async function handleWhatsApp(event) {
     session.bookingDraft.date = dateStr;
   }
   if (!session.bookingDraft.time) {
-    const inferredTime = inferAmbiguousTime(text, session);
+    const inferredTime = inferAmbiguousTime(text, session, { normalizeText, getMexicoDateParts });
     if (inferredTime) {
       session.bookingDraft.time = inferredTime;
       obsLog("time_inferred", { traceId, phone: phone.slice(-4), inferredTime, source: "ambiguous_hour_today" });
@@ -1682,7 +1260,11 @@ async function handleWhatsApp(event) {
     }
   }
 
-  const resolvedReta = resolveRetaSelectionFromText(text, session);
+  const resolvedReta = resolveRetaSelectionFromText(text, session, {
+    normalizeText,
+    getMexicoDateParts,
+    mexicoTz: config.mexicoTz
+  });
   if (resolvedReta?.eventId) {
     session.retaDraft.eventId = resolvedReta.eventId;
     obsLog("reta_selected", {
@@ -1693,10 +1275,10 @@ async function handleWhatsApp(event) {
     });
   }
 
-  if (isCourtesyOnlyMessage(text)) {
+  if (isCourtesyOnlyMessage(text, normalizeText, AGENT_POLICY.courtesyPhrases)) {
     const courtesyReply = buildCourtesyReply(session);
     session.messages.push({ role: "assistant", content: courtesyReply });
-    await safeSendText(phone, courtesyReply, flowToken);
+    await channelIO.safeSendText(phone, courtesyReply, flowToken);
     await saveSession(phone, session);
     await incrementMetric("courtesy_message_short_circuit");
     obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "courtesy_short_circuit" });
@@ -1725,7 +1307,7 @@ async function handleWhatsApp(event) {
   if (decision.needsEscalation) {
     await incrementMetric("escalations_triggered");
     obsLog("escalation_triggered", { traceId, phone: phone.slice(-4) });
-    await safeSendText(phone, decision.response || "Dame un momento para revisar...", flowToken);
+    await channelIO.safeSendText(phone, decision.response || "Dame un momento para revisar...", flowToken);
     try {
       await humanMonitor.escalateToHuman(phone, "subtle_escalation", config.escalationWebhook);
       logger?.info?.(`[SUBTLE ESCALATION] Escalated: ${phone}`);
@@ -1754,7 +1336,7 @@ async function handleWhatsApp(event) {
       const toolStartedAt = Date.now();
 
       if (toolName === "get_user") {
-        const userInfo = await findUser(args.phone || phone);
+        const userInfo = await toolAdapters.findUser(args.phone || phone);
         session.user = userInfo;
         if (userInfo?.last_name) session.userLastName = userInfo.last_name;
         logger?.info?.(`[TOOL] get_user: ${userInfo?.name || 'not found'}`);
@@ -1776,7 +1358,7 @@ async function handleWhatsApp(event) {
           }
 
           try {
-            const slots = await getAvailableHours(date, sport);
+            const slots = await toolAdapters.getAvailableHours(date, sport);
             const options = buildOptions(slots, 1);
             let timesList = startTimesFromOptions(options);
 
@@ -1817,7 +1399,7 @@ async function handleWhatsApp(event) {
 
           try {
             if (!session.options?.length) {
-              const slots = await getAvailableHours(bookingDate, bookingSport);
+              const slots = await toolAdapters.getAvailableHours(bookingDate, bookingSport);
               session.options = buildOptions(slots, 1);
             }
 
@@ -1831,7 +1413,7 @@ async function handleWhatsApp(event) {
               continue;
             }
 
-            await confirmBooking(
+            await toolAdapters.confirmBooking(
               phone,
               bookingDate,
               match.times,
@@ -1902,14 +1484,14 @@ async function handleWhatsApp(event) {
       else if (toolName === "get_retas") {
         try {
           const previousSelection = session?.retaDraft?.eventId || null;
-          const allRetas = await getRetas();
+          const allRetas = await toolAdapters.getRetas();
           const normalized = allRetas
-            .map(normalizeRetaRecord)
+            .map(toolAdapters.normalizeRetaRecord)
             .filter(r => r.eventId)
             .sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
 
           const intentText = args.query_text || text;
-          const filtered = filterRetasByIntent(normalized, intentText);
+          const filtered = toolAdapters.filterRetasByIntent(normalized, intentText);
           const finalRetas = filtered.length > 0 ? filtered : normalized;
 
           session.retas = finalRetas;
@@ -1963,7 +1545,7 @@ async function handleWhatsApp(event) {
         }
 
         try {
-          const registrationResult = await confirmRetaUser(eventId, userId);
+          const registrationResult = await toolAdapters.confirmRetaUser(eventId, userId);
           session.retaDraft = session.retaDraft || { eventId: null };
           session.retaDraft.eventId = eventId;
 
@@ -1994,7 +1576,7 @@ async function handleWhatsApp(event) {
         }
 
         try {
-          const registrationResult = await confirmRetaGuest(eventId, {
+          const registrationResult = await toolAdapters.confirmRetaGuest(eventId, {
             name: guestName,
             lastName: guestLastName,
             phone: guestPhone
@@ -2033,7 +1615,7 @@ async function handleWhatsApp(event) {
         );
 
         if (followUpDecision.response) {
-          await safeSendText(phone, followUpDecision.response, flowToken);
+          await channelIO.safeSendText(phone, followUpDecision.response, flowToken);
         }
 
         if (followUpDecision.toolCalls?.length > 0) {
@@ -2056,14 +1638,14 @@ async function handleWhatsApp(event) {
               const lastName = followUpArgs.last_name || "";
 
               if (!session.options?.length) {
-                const slots = await getAvailableHours(date, sport);
+                const slots = await toolAdapters.getAvailableHours(date, sport);
                 session.options = buildOptions(slots, 1);
               }
 
               const match = session.options.find(o => o.start === time);
               if (match) {
                 try {
-                  await confirmBooking(
+                  await toolAdapters.confirmBooking(
                     phone, date, match.times, match.court,
                     name, lastName,
                     session.user?.id, sport,
@@ -2086,10 +1668,10 @@ async function handleWhatsApp(event) {
                   session.hours = null;
                   await saveSession(phone, session);
                   
-                  await safeSendText(phone, `¡Listo! Te llegará la confirmación por WhatsApp.`, flowToken);
+                  await channelIO.safeSendText(phone, `¡Listo! Te llegará la confirmación por WhatsApp.`, flowToken);
                 } catch (bookErr) {
                   logger?.error?.(`[BOOKING ERROR] ${bookErr.message}`);
-                  await safeSendText(phone, `No pude confirmar. ¿Quieres intentar otra hora?`, flowToken);
+                  await channelIO.safeSendText(phone, `No pude confirmar. ¿Quieres intentar otra hora?`, flowToken);
                 }
               }
             }
@@ -2107,8 +1689,8 @@ async function handleWhatsApp(event) {
     // Check if response is about location
     const isLocationResponse = /ubicaci[óo]n|direcci[óo]n|d[óo]nde|mapa/i.test(decision.response);
     if (isLocationResponse) {
-      await safeSendText(phone, decision.response, flowToken);
-      await safeSendLocation(
+      await channelIO.safeSendText(phone, decision.response, flowToken);
+      await channelIO.safeSendLocation(
         phone,
         CLUB_INFO.location.latitude,
         CLUB_INFO.location.longitude,
@@ -2117,7 +1699,7 @@ async function handleWhatsApp(event) {
         flowToken
       );
     } else {
-      await safeSendText(phone, decision.response, flowToken);
+      await channelIO.safeSendText(phone, decision.response, flowToken);
     }
     await saveSession(phone, session);
     obsLog("request_completed", { traceId, latencyMs: Date.now() - requestStartedAt, path: "ai_response" });

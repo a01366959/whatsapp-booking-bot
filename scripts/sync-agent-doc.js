@@ -7,6 +7,8 @@ const __dirname = path.dirname(__filename);
 const root = path.resolve(__dirname, "..");
 
 const corePath = path.join(root, "agent_core.js");
+const policyPath = path.join(root, "agent_policy.js");
+const runtimeConfigPath = path.join(root, "agent_runtime_config.js");
 const docPath = path.join(root, "agent_maker.agent.md");
 
 const START = "<!-- AUTO_STATE:START -->";
@@ -14,7 +16,7 @@ const END = "<!-- AUTO_STATE:END -->";
 
 function extractTools(coreText) {
   const start = coreText.indexOf("const TOOLS = [");
-  const end = coreText.indexOf("const TOOL_RESPONSE_EXPECTATIONS", start);
+  const end = coreText.indexOf("export function init", start);
   if (start === -1 || end === -1) return [];
 
   const toolsBlock = coreText.slice(start, end);
@@ -22,9 +24,9 @@ function extractTools(coreText) {
   return [...new Set(matches.map(m => m[1]))].filter(Boolean);
 }
 
-function extractToolExpectations(coreText) {
+function extractToolExpectations(policyText) {
   const map = new Map();
-  const blockMatch = coreText.match(/const TOOL_RESPONSE_EXPECTATIONS = \{([\s\S]*?)\n\};/);
+  const blockMatch = policyText.match(/export const TOOL_RESPONSE_EXPECTATIONS = \{([\s\S]*?)\n\};/);
   if (!blockMatch) return map;
 
   const block = blockMatch[1];
@@ -42,13 +44,18 @@ function extractToolExpectations(coreText) {
   return map;
 }
 
-function extractBurstDefault(coreText) {
-  const line = coreText
+function extractBurstDefault(coreText, runtimeConfigText) {
+  const coreLine = coreText
     .split("\n")
     .find(l => l.includes("messageBurstHoldMs:"));
-  if (!line) return "unknown";
-  const fallback = line.match(/\|\|\s*(\d+)\s*\)/)?.[1];
-  return fallback || "unknown";
+  if (coreLine) {
+    const fallback = coreLine.match(/\|\|\s*(\d+)\s*\)/)?.[1];
+    if (fallback) return fallback;
+  }
+
+  const runtimeMatch = runtimeConfigText.match(/messageBurstHoldMs:\s*Number\([^)]*\|\|\s*(\d+)\)/);
+  if (runtimeMatch?.[1]) return runtimeMatch[1];
+  return "unknown";
 }
 
 function buildStateBlock({ tools, expectations, burstDefault }) {
@@ -99,11 +106,13 @@ function upsertStateBlock(docText, stateBlock) {
 
 function main() {
   const coreText = fs.readFileSync(corePath, "utf8");
+  const policyText = fs.readFileSync(policyPath, "utf8");
+  const runtimeConfigText = fs.readFileSync(runtimeConfigPath, "utf8");
   const docText = fs.readFileSync(docPath, "utf8");
 
   const tools = extractTools(coreText);
-  const expectations = extractToolExpectations(coreText);
-  const burstDefault = extractBurstDefault(coreText);
+  const expectations = extractToolExpectations(policyText);
+  const burstDefault = extractBurstDefault(coreText, runtimeConfigText);
   const stateBlock = buildStateBlock({ tools, expectations, burstDefault });
 
   const updated = upsertStateBlock(docText, stateBlock);
