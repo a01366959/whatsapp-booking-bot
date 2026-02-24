@@ -87,14 +87,20 @@ ANTI-PATTERNS TO AVOID
 
 <!-- AUTO_STATE:START -->
 ## Runtime Current State (Auto-generated)
-- Generated at: 2026-02-24T20:00:00.000Z
+- Generated at: 2026-02-24T21:05:00.000Z
 - Message burst hold default (ms): 1200
 - Registered tools:
 - get_user
 - get_hours
 - confirm_booking
+- get_retas
+- confirm_reta_user
+- confirm_reta_guest
 - Tool response contracts:
 - get_user: success="User found: <name>" | empty="User not found" | behavior="If user exists, personalize and avoid re-asking name."
 - get_hours: success="Available times for <sport> on <date>: HH:00, HH:00" | empty="No availability for <sport> on <date>" | behavior="If times exist, ask user to choose one specific time."
 - confirm_booking: success="Booking confirmed! <sport> on <date> at <time> for <name>" | empty="Cannot confirm: missing sport, date, time, or name" | behavior="After success, acknowledge confirmation and do not re-confirm same booking."
+- get_retas: success="Active retas: [event_id=_id, name, date, mode, price]" | empty="No active upcoming retas" | behavior="If multiple retas match, ask user to choose one before confirming registration."
+- confirm_reta_user: success="Reta registration confirmed for existing user" | empty="Cannot register reta user: missing event_id or user_id" | behavior="Use only after explicit user choice of reta event and known user_id."
+- confirm_reta_guest: success="Reta guest registration confirmed" | empty="Cannot register reta guest: missing event_id, name, last_name, or phone" | behavior="Use only when user is not found and full guest name is collected."
 <!-- AUTO_STATE:END -->

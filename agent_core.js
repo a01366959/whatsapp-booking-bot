@@ -157,6 +157,58 @@ const TOOLS = [
         additionalProperties: false
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_retas",
+      description: "Get active upcoming retas events. Use when user asks about retas/americana. Returns list of events with event_id (_id), name, date, mode, and price.",
+      parameters: {
+        type: "object",
+        properties: {
+          query_text: {
+            type: "string",
+            description: "Optional user text to filter by month/mode/name intent"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_reta_user",
+      description: "Register an EXISTING user into a reta event. Requires event_id from get_retas (_id) and user_id from get_user.",
+      parameters: {
+        type: "object",
+        properties: {
+          event_id: { type: "string", description: "Reta event _id from get_retas" },
+          user_id: { type: "string", description: "User id from get_user" }
+        },
+        required: ["event_id", "user_id"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "confirm_reta_guest",
+      description: "Register a GUEST into a reta event when user is not found. Requires event_id and full guest identity.",
+      parameters: {
+        type: "object",
+        properties: {
+          event_id: { type: "string", description: "Reta event _id from get_retas" },
+          name: { type: "string", description: "Guest first name" },
+          last_name: { type: "string", description: "Guest last name" },
+          phone: { type: "string", description: "10-digit phone" }
+        },
+        required: ["event_id", "name", "last_name", "phone"],
+        additionalProperties: false
+      }
+    }
   }
 ];
 
@@ -175,6 +227,21 @@ const TOOL_RESPONSE_EXPECTATIONS = {
     success: "Booking confirmed! <sport> on <date> at <time> for <name>",
     empty: "Cannot confirm: missing sport, date, time, or name",
     behavior: "After success, acknowledge confirmation and do not re-confirm same booking."
+  },
+  get_retas: {
+    success: "Active retas: [event_id=_id, name, date, mode, price]",
+    empty: "No active upcoming retas",
+    behavior: "If multiple retas match, ask user to choose one before confirming registration."
+  },
+  confirm_reta_user: {
+    success: "Reta registration confirmed for existing user",
+    empty: "Cannot register reta user: missing event_id or user_id",
+    behavior: "Use only after explicit user choice of reta event and known user_id."
+  },
+  confirm_reta_guest: {
+    success: "Reta guest registration confirmed",
+    empty: "Cannot register reta guest: missing event_id, name, last_name, or phone",
+    behavior: "Use only when user is not found and full guest name is collected."
   }
 };
 
@@ -954,6 +1021,91 @@ async function getAvailableHours(date, desiredSport) {
   return r.data?.response?.hours || [];
 }
 
+function toEpochMs(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num > 1e12 ? num : num * 1000;
+}
+
+function formatEventDateEs(value) {
+  const epochMs = toEpochMs(value);
+  if (!epochMs) return "fecha por confirmar";
+  return new Intl.DateTimeFormat("es-MX", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: config.mexicoTz || "America/Mexico_City"
+  }).format(new Date(epochMs));
+}
+
+function normalizeRetaRecord(reta) {
+  const rawName = reta?.["Public name"] || reta?.Name || "Reta";
+  const name = String(rawName).trim();
+  const eventId = reta?._id || null;
+  const fixedPair = Boolean(reta?.["Pareja Fija"]);
+  const mode = fixedPair ? "pareja fija" : "individual";
+  return {
+    eventId,
+    name,
+    mode,
+    dateLabel: formatEventDateEs(reta?.["Date inicio"]),
+    dateMs: toEpochMs(reta?.["Date inicio"]) || 0,
+    price: reta?.price_per_event ?? null,
+    raw: reta
+  };
+}
+
+function filterRetasByIntent(retas, queryText) {
+  const normalized = normalizeText(queryText || "");
+  if (!normalized) return retas;
+
+  let filtered = [...retas];
+  if (/pareja\s+fija/.test(normalized)) {
+    filtered = filtered.filter(r => r.mode === "pareja fija");
+  } else if (/individual/.test(normalized)) {
+    filtered = filtered.filter(r => r.mode === "individual");
+  }
+
+  const monthHit = Object.entries(MONTH_INDEX).find(([monthName]) => new RegExp(`\\b${monthName}\\b`).test(normalized));
+  if (monthHit) {
+    const monthNum = monthHit[1];
+    const monthFiltered = filtered.filter(r => {
+      if (!r.dateMs) return false;
+      return new Date(r.dateMs).getUTCMonth() + 1 === monthNum;
+    });
+    if (monthFiltered.length > 0) filtered = monthFiltered;
+  }
+
+  const nameFiltered = filtered.filter(r => normalizeText(r.name).includes(normalized));
+  if (nameFiltered.length > 0) filtered = nameFiltered;
+
+  return filtered;
+}
+
+async function getRetas() {
+  const r = await bubbleRequest("get", "/get_retas");
+  const found = Boolean(r.data?.response?.found);
+  const retas = Array.isArray(r.data?.response?.retas) ? r.data.response.retas : [];
+  if (!found || retas.length === 0) return [];
+  return retas;
+}
+
+async function confirmRetaUser(eventId, userId) {
+  const body = { event: eventId, users: [userId] };
+  const r = await bubbleRequest("post", "/confirm_reta_user", { data: body });
+  return r.data?.response?.response || "ok";
+}
+
+async function confirmRetaGuest(eventId, guest) {
+  const body = {
+    event: eventId,
+    name: guest.name,
+    last_name: guest.lastName,
+    phone: normalizePhone(guest.phone)
+  };
+  const r = await bubbleRequest("post", "/confirm_reta_guest", { data: body });
+  return r.data?.response?.response || "ok";
+}
+
 async function confirmBooking(phone, date, times, court, name, lastName, userId, sport, userType) {
   const bubbleDate = toBubbleDate(date);
   const basePayload = {
@@ -1176,11 +1328,16 @@ REGLAS CRÍTICAS
 3) No confirmes reserva sin sport+date+time+name.
 4) No repitas confirmaciones ni ofrezcas horarios si ya hay reserva confirmada, salvo que el usuario pida otra reserva explícitamente.
 5) Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.
+6) Para retas, NUNCA inscribas sin elección explícita del evento cuando haya más de una opción.
+7) Para retas usa event_id = _id devuelto por get_retas (no uses ID corto).
 
 USO DE HERRAMIENTAS
 - get_hours(sport, date): cuando tengas deporte+fecha.
 - confirm_booking(...): solo con sport+date+time+name y confirmación explícita del usuario.
 - get_user(phone): cuando falte nombre.
+- get_retas(query_text?): cuando pidan retas/americana o quieran inscribirse.
+- confirm_reta_user(event_id, user_id): cuando el usuario existe y eligió reta explícitamente.
+- confirm_reta_guest(event_id, name, last_name, phone): cuando NO existe usuario y ya diste nombre completo.
 
 CONTRATOS DE RESPUESTA DE TOOLS
 ${Object.entries(TOOL_RESPONSE_EXPECTATIONS)
@@ -1615,6 +1772,119 @@ async function handleWhatsApp(event) {
             await incrementMetric(`tool_${toolName}_error`);
           }
         }
+
+      else if (toolName === "get_retas") {
+        try {
+          const allRetas = await getRetas();
+          const normalized = allRetas
+            .map(normalizeRetaRecord)
+            .filter(r => r.eventId)
+            .sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
+
+          const intentText = args.query_text || text;
+          const filtered = filterRetasByIntent(normalized, intentText);
+          const finalRetas = filtered.length > 0 ? filtered : normalized;
+
+          session.retas = finalRetas;
+          session.retaDraft = session.retaDraft || { eventId: null };
+          if (finalRetas.length === 1) {
+            session.retaDraft.eventId = finalRetas[0].eventId;
+          }
+
+          if (finalRetas.length === 0) {
+            toolResults.push({ toolName, result: "No active upcoming retas" });
+          } else if (finalRetas.length === 1) {
+            const only = finalRetas[0];
+            const priceText = only.price != null ? `$${only.price} MXN` : "precio por confirmar";
+            toolResults.push({
+              toolName,
+              result: `1 reta encontrada: event_id=${only.eventId}, nombre=${only.name}, fecha=${only.dateLabel}, modalidad=${only.mode}, precio=${priceText}`
+            });
+          } else {
+            const listed = finalRetas
+              .slice(0, 8)
+              .map((r, idx) => {
+                const priceText = r.price != null ? `$${r.price} MXN` : "precio por confirmar";
+                return `${idx + 1}) event_id=${r.eventId} | ${r.name} | ${r.dateLabel} | ${r.mode} | ${priceText}`;
+              })
+              .join(" ; ");
+            toolResults.push({
+              toolName,
+              result: `Hay ${finalRetas.length} retas activas. Pide elección explícita antes de confirmar. Opciones: ${listed}`
+            });
+          }
+          obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+          await incrementMetric(`tool_${toolName}`);
+        } catch (err) {
+          toolResults.push({ toolName, result: `Error fetching retas: ${err.message}` });
+          obsLog("tool_failed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, error: err.message });
+          await incrementMetric(`tool_${toolName}_error`);
+        }
+      }
+
+      else if (toolName === "confirm_reta_user") {
+        const availableRetas = Array.isArray(session.retas) ? session.retas : [];
+        const eventId = args.event_id || args.event || session.retaDraft?.eventId || (availableRetas.length === 1 ? availableRetas[0].eventId : null);
+        const userId = args.user_id || session.user?.id;
+
+        if (!eventId || !userId) {
+          toolResults.push({ toolName, result: "Cannot register reta user: missing event_id or user_id" });
+          continue;
+        }
+
+        try {
+          const registrationResult = await confirmRetaUser(eventId, userId);
+          session.retaDraft = session.retaDraft || { eventId: null };
+          session.retaDraft.eventId = eventId;
+
+          if (/usuario\s+ya\s+registrado/i.test(String(registrationResult || ""))) {
+            toolResults.push({ toolName, result: `User already registered in reta event ${eventId}` });
+          } else {
+            toolResults.push({ toolName, result: `Reta registration confirmed for existing user in event ${eventId}` });
+          }
+          obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+          await incrementMetric(`tool_${toolName}`);
+        } catch (err) {
+          toolResults.push({ toolName, result: `Reta registration failed: ${err.message}` });
+          obsLog("tool_failed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, error: err.message });
+          await incrementMetric(`tool_${toolName}_error`);
+        }
+      }
+
+      else if (toolName === "confirm_reta_guest") {
+        const availableRetas = Array.isArray(session.retas) ? session.retas : [];
+        const eventId = args.event_id || args.event || session.retaDraft?.eventId || (availableRetas.length === 1 ? availableRetas[0].eventId : null);
+        const guestName = (args.name || "").trim();
+        const guestLastName = (args.last_name || "").trim();
+        const guestPhone = normalizePhone(args.phone || phone);
+
+        if (!eventId || !guestName || !guestLastName || !guestPhone) {
+          toolResults.push({ toolName, result: "Cannot register reta guest: missing event_id, name, last_name, or phone" });
+          continue;
+        }
+
+        try {
+          const registrationResult = await confirmRetaGuest(eventId, {
+            name: guestName,
+            lastName: guestLastName,
+            phone: guestPhone
+          });
+          session.retaDraft = session.retaDraft || { eventId: null };
+          session.retaDraft.eventId = eventId;
+
+          if (/usuario\s+ya\s+registrado/i.test(String(registrationResult || ""))) {
+            toolResults.push({ toolName, result: `Guest already registered in reta event ${eventId}` });
+          } else {
+            toolResults.push({ toolName, result: `Reta guest registration confirmed in event ${eventId}` });
+          }
+          obsLog("tool_executed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, ok: true });
+          await incrementMetric(`tool_${toolName}`);
+        } catch (err) {
+          toolResults.push({ toolName, result: `Reta guest registration failed: ${err.message}` });
+          obsLog("tool_failed", { traceId, toolName, latencyMs: Date.now() - toolStartedAt, error: err.message });
+          await incrementMetric(`tool_${toolName}_error`);
+        }
+      }
       }
 
       // AGENTIC LOOP: Feed tool results back to AI
