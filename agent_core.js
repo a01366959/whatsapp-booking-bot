@@ -815,6 +815,78 @@ function buildCourtesyReply(session) {
   return `¡Con gusto${suffix}! Aquí estoy si necesitas algo más.`;
 }
 
+function dateKeyInMexicoFromEpoch(epochMs) {
+  if (!epochMs) return null;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: config.mexicoTz || "America/Mexico_City",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(epochMs));
+}
+
+function getSelectedReta(session) {
+  const eventId = session?.retaDraft?.eventId;
+  const retas = Array.isArray(session?.retas) ? session.retas : [];
+  if (!eventId) return null;
+  return retas.find(r => r.eventId === eventId) || null;
+}
+
+function hasRetaSignupIntent(text) {
+  const t = normalizeText(text || "");
+  return /\b(si|sii|sip|si por favor|por favor|inscrib|registr|anot|apunt)\b/.test(t);
+}
+
+function resolveRetaSelectionFromText(text, session) {
+  const retas = Array.isArray(session?.retas) ? session.retas : [];
+  if (!retas.length) return null;
+
+  const normalized = normalizeText(text || "");
+  if (!normalized) return null;
+
+  const byId = retas.find(r => normalized.includes(normalizeText(r.eventId || "")));
+  if (byId) return byId;
+
+  const ordered = [...retas].sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
+  const ordinalMap = [
+    { n: 1, rx: /\b(1|uno|primera|primer)\b/ },
+    { n: 2, rx: /\b(2|dos|segunda|segundo)\b/ },
+    { n: 3, rx: /\b(3|tres|tercera|tercero)\b/ }
+  ];
+  for (const ord of ordinalMap) {
+    if (ord.rx.test(normalized) && ordered[ord.n - 1]) return ordered[ord.n - 1];
+  }
+
+  const today = getMexicoDateParts().dateStr;
+  if (/\bhoy\b/.test(normalized)) {
+    const todayMatches = ordered.filter(r => dateKeyInMexicoFromEpoch(r.dateMs) === today);
+    if (todayMatches.length === 1) return todayMatches[0];
+  }
+
+  if (/\bmanana|mañana\b/.test(normalized)) {
+    const now = new Date(`${today}T00:00:00Z`).getTime();
+    const tomorrow = dateKeyInMexicoFromEpoch(now + 24 * 60 * 60 * 1000);
+    const tomorrowMatches = ordered.filter(r => dateKeyInMexicoFromEpoch(r.dateMs) === tomorrow);
+    if (tomorrowMatches.length === 1) return tomorrowMatches[0];
+  }
+
+  const nameMatches = ordered.filter(r => normalizeText(r.name).includes(normalized));
+  if (nameMatches.length === 1) return nameMatches[0];
+
+  return null;
+}
+
+function buildSyntheticToolCall(name, args) {
+  return {
+    id: `auto_${name}_${Date.now()}`,
+    type: "function",
+    function: {
+      name,
+      arguments: JSON.stringify(args)
+    }
+  };
+}
+
 /**
  * Get conversation history for context-aware responses
  * Retrieves last N messages from human_monitor conversation log
@@ -1293,6 +1365,44 @@ IMPORTANTE: Si el usuario te pregunta "como me llamo" y user_name no es "descono
 
 async function agentDecide(phone, userText, session) {
   if (!openai) return { response: "¿Me repites, por favor?", toolCalls: [], needsEscalation: false };
+
+  const selectedReta = getSelectedReta(session);
+  if (selectedReta && hasRetaSignupIntent(userText)) {
+    if (session?.user?.found && session?.user?.id) {
+      return {
+        response: "Perfecto, te inscribo ahora mismo.",
+        toolCalls: [buildSyntheticToolCall("confirm_reta_user", {
+          event_id: selectedReta.eventId,
+          user_id: session.user.id
+        })],
+        needsEscalation: false,
+        rawMessage: null
+      };
+    }
+
+    const guestName = session?.user?.name || session?.bookingDraft?.name || null;
+    const guestLastName = session?.userLastName || session?.bookingDraft?.lastName || null;
+    if (guestName && guestLastName) {
+      return {
+        response: "Perfecto, te registro como invitado en este momento.",
+        toolCalls: [buildSyntheticToolCall("confirm_reta_guest", {
+          event_id: selectedReta.eventId,
+          name: guestName,
+          last_name: guestLastName,
+          phone
+        })],
+        needsEscalation: false,
+        rawMessage: null
+      };
+    }
+
+    return {
+      response: "¡Va! Para inscribirte a la reta necesito tu nombre y apellido.",
+      toolCalls: [],
+      needsEscalation: false,
+      rawMessage: null
+    };
+  }
   
   const { dateStr } = getMexicoDateParts();
   
@@ -1304,6 +1414,14 @@ async function agentDecide(phone, userText, session) {
     user_name: session?.user?.name || null,
     last_name: session?.userLastName || null,
     available_times: session?.hours || [],
+    selected_reta_event_id: session?.retaDraft?.eventId || null,
+    available_retas: Array.isArray(session?.retas) ? session.retas.slice(0, 8).map(r => ({
+      event_id: r.eventId,
+      name: r.name,
+      date: r.dateLabel,
+      mode: r.mode,
+      price: r.price
+    })) : [],
     confirmed_bookings: confirmedBookings,
     conversation_history: session?.messages || []
   };
@@ -1330,6 +1448,8 @@ REGLAS CRÍTICAS
 5) Si preguntan por retas/torneos/clases y ya hay reserva, responde info de servicio y sugiere contacto del club; no inicies reserva nueva.
 6) Para retas, NUNCA inscribas sin elección explícita del evento cuando haya más de una opción.
 7) Para retas usa event_id = _id devuelto por get_retas (no uses ID corto).
+8) Si ya hay un evento de reta seleccionado y el usuario confirma con "sí" o intención de inscribirse, ejecuta confirmación inmediatamente; no vuelvas a preguntar lo mismo.
+9) Evita repetir la misma pregunta en turnos consecutivos; avanza el flujo.
 
 USO DE HERRAMIENTAS
 - get_hours(sport, date): cuando tengas deporte+fecha.
@@ -1349,6 +1469,8 @@ ESTADO ACTUAL
 - user_name: ${sessionContext?.user_name || "null"}
 - last_name: ${sessionContext?.last_name || "null"}
 - available_times: ${(sessionContext?.available_times || []).join(", ") || "[]"}
+- selected_reta_event_id: ${sessionContext?.selected_reta_event_id || "null"}
+- available_retas: ${JSON.stringify(sessionContext?.available_retas || [], null, 2)}
 
 ${hasRecentBooking ? `RESERVAS CONFIRMADAS:
 ${confirmedBookings.map(b => `- ${b.sport} el ${formatDateEs(b.date)} a las ${b.time} para ${b.name}`).join("\n")}
@@ -1357,6 +1479,7 @@ ${confirmedBookings.map(b => `- ${b.sport} el ${formatDateEs(b.date)} a las ${b.
 FORMATO DE RESPUESTA
 - Máximo 2 frases.
 - Natural, sin sonar robótica.
+- Varía redacción y evita plantillas repetidas.
 - Si falta un dato, pide solo ese dato.
 - Si todo está completo y confirmado por el usuario, procede con confirm_booking.`;
 
@@ -1382,7 +1505,9 @@ FORMATO DE RESPUESTA
       messages,
       tools: TOOLS,
       tool_choice: "auto",  // Let AI decide when to use tools
-      temperature: 0.7  // Increased for natural variation
+      temperature: 0.8,
+      presence_penalty: 0.35,
+      frequency_penalty: 0.3
     });
 
     const message = response.choices[0]?.message;
@@ -1516,11 +1641,15 @@ async function handleWhatsApp(event) {
       lastTs: 0,
       bookingDraft: { sport: null, date: null, time: null, duration: 1, name: null, lastName: null },
       confirmedBookings: [],
+      retaDraft: { eventId: null },
+      retas: [],
       hours: null
     };
   }
   // Ensure confirmedBookings exists and hydrate with durable memory
   session.confirmedBookings = session.confirmedBookings || [];
+  session.retaDraft = session.retaDraft || { eventId: null };
+  session.retas = Array.isArray(session.retas) ? session.retas : [];
   const durableBookings = (await getConfirmedBookings(phone)) || [];
   session.confirmedBookings = mergeBookings(session.confirmedBookings, durableBookings);
   session.phone = phone;
@@ -1565,6 +1694,17 @@ async function handleWhatsApp(event) {
       obsLog("time_inferred", { traceId, phone: phone.slice(-4), inferredTime, source: "ambiguous_hour_today" });
       await incrementMetric("time_inferred_ambiguous_hour");
     }
+  }
+
+  const resolvedReta = resolveRetaSelectionFromText(text, session);
+  if (resolvedReta?.eventId) {
+    session.retaDraft.eventId = resolvedReta.eventId;
+    obsLog("reta_selected", {
+      traceId,
+      phone: phone.slice(-4),
+      eventId: resolvedReta.eventId,
+      source: "user_text"
+    });
   }
 
   if (isCourtesyOnlyMessage(text)) {
@@ -1775,6 +1915,7 @@ async function handleWhatsApp(event) {
 
       else if (toolName === "get_retas") {
         try {
+          const previousSelection = session?.retaDraft?.eventId || null;
           const allRetas = await getRetas();
           const normalized = allRetas
             .map(normalizeRetaRecord)
@@ -1787,6 +1928,9 @@ async function handleWhatsApp(event) {
 
           session.retas = finalRetas;
           session.retaDraft = session.retaDraft || { eventId: null };
+          if (previousSelection && finalRetas.some(r => r.eventId === previousSelection)) {
+            session.retaDraft.eventId = previousSelection;
+          }
           if (finalRetas.length === 1) {
             session.retaDraft.eventId = finalRetas[0].eventId;
           }
