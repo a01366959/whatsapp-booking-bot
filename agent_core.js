@@ -1437,7 +1437,10 @@ async function handleWhatsApp(event) {
   const msgId = msg.id;
   if (msgId) {
     const firstTime = await markMessageProcessed(msgId);
-    if (!firstTime) return { actions: [] };
+    if (!firstTime) {
+      logger?.info?.(`[DEDUP] Skipping duplicate message ${msgId.slice(-8)}`);
+      return { actions: [] };
+    }
   }
 
   const phone = normalizePhone(msg.from || event.phone || "");
@@ -1452,8 +1455,20 @@ async function handleWhatsApp(event) {
     msg.interactive?.list_reply?.id ||
     event.text ||
     "";
-  const normalizedText = text.trim().toLowerCase();
-  const cleanText = normalizeText(text);
+  const trimmedText = text.trim();
+  if (!trimmedText) {
+    logger?.info?.(`[FILTER] Ignoring empty message from ${phone.slice(-4)}`);
+    return { actions: [] };
+  }
+  const msgType = msg.type || "text";
+  const isReaction = msgType === "reaction" || Boolean(msg.reaction);
+  const isSticker = msgType === "sticker" || Boolean(msg.sticker);
+  if (isReaction || isSticker) {
+    logger?.info?.(`[FILTER] Ignoring ${msgType} from ${phone.slice(-4)}`);
+    return { actions: [] };
+  }
+  const normalizedText = trimmedText.toLowerCase();
+  const cleanText = normalizeText(trimmedText);
   const msgTs = Number(msg.timestamp || event.ts || 0);
 
   // Log user message in conversation history
